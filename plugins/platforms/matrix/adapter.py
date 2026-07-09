@@ -2128,7 +2128,19 @@ class MatrixAdapter(BasePlatformAdapter):
         return result
 
     def format_message(self, content: str) -> str:
-        """Pass-through — Matrix supports standard Markdown natively."""
+        """Pass-through — Matrix supports standard Markdown natively.
+        Handles model-specific reasoning blocks (e.g. <thought> for Gemma)
+        by wrapping them in blockquotes for visual separation in Matrix.
+        """
+        # Wrap reasoning/thought blocks in blockquotes for visual distinction.
+        # Matches <thought>...</thought>, <reasoning>...</reasoning>, or unclosed tags.
+        content = re.sub(
+            r"<(thought|reasoning)>(.*?)(?:</\1>|$)",
+            r"<blockquote>\2</blockquote>",
+            content,
+            flags=re.DOTALL
+        )
+
         # Strip image markdown; media is uploaded separately.
         content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", content)
         return content
@@ -2588,6 +2600,29 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id, sender, event_id, event_ts, source_content, relates_to
             )
 
+    def _room_profile(self, room_id: str) -> str:
+        """room_id -> profile dir name from platforms.matrix.room_profile_map.
+
+        SILAS patch (silas_ext/reapply.py). Reads the raw config.yaml because
+        PlatformConfig silently drops unknown keys. Cached after first load.
+        """
+        cache = getattr(self, "_room_profile_map_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                import yaml as _yaml
+                _cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+                with open(_cfg_path, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                _m = (((_raw.get("platforms") or {}).get("matrix") or {})
+                      .get("room_profile_map") or {})
+                if isinstance(_m, dict):
+                    cache = {str(k): str(v) for k, v in _m.items()}
+            except Exception as exc:
+                logger.warning("Matrix: room_profile_map load failed: %s", exc)
+            self._room_profile_map_cache = cache
+        return cache.get(room_id, "")
+
     async def _resolve_message_context(
         self,
         room_id: str,
@@ -2701,6 +2736,14 @@ class MatrixAdapter(BasePlatformAdapter):
 
         if thread_id:
             self._threads.mark(thread_id)
+
+        _profile = self._room_profile(room_id)
+        if _profile and _profile != "default":
+            source.profile = _profile
+            logger.info(
+                "Matrix: routing message from room %s to profile %s",
+                room_id, _profile,
+            )
 
         self._background_read_receipt(room_id, event_id)
 
@@ -2959,7 +3002,16 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         body, is_dm, chat_type, thread_id, display_name, source = ctx
 
-        if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
+        # MSC2530 (SILAS_EXT_MSC2530_CAPTIONS): a top-level "filename" field marks the
+        # transport name; the body is a user-typed caption only when it differs. This is
+        # authoritative — even a caption that *looks* like a filename (e.g. "screenshot.png")
+        # is kept when the sender declared a different real filename. The old suffix
+        # heuristic remains only for legacy clients that never send "filename".
+        declared_filename = str(source_content.get("filename") or "").strip()
+        if declared_filename:
+            if body.strip() == declared_filename:
+                body = ""
+        elif msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
 
         allow_http_fallback = bool(http_url) and not is_encrypted_media

@@ -4767,6 +4767,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
+            try:
+                from gateway.keryx_stream import register_keryx_routes
+                register_keryx_routes(self._app.router, self._check_auth)
+            except Exception:
+                logger.debug("keryx routes unavailable", exc_info=True)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
