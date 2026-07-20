@@ -79,7 +79,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+compression\s+model\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    # SILAS patch (silas_ext/reapply.py): SILAS_COMPACTION_STATUS_VISIBLE —
+    # the compaction status is user-facing on Matrix/Keryx; pattern removed
+    # (was: r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation").
     r"|preflight\s+compression"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
@@ -8597,6 +8599,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(self.config, "multiplex_profiles", False):
             return 0
 
+        if os.environ.get("HERMES_MULTIPLEX_ROUTING_ONLY", "").strip().lower() in ("1", "true", "yes", "on"):
+            # SILAS_EXT_ROUTING_ONLY_REGISTER: shared-credential personas.
+            # Register every served profile on the SHARED adapters so a
+            # stamped source resolves to a live adapter for authorization and
+            # egress instead of failing closed, and give each profile its own
+            # PairingStore (upstream's loop below references PairingStore as
+            # an unbound name and its blanket except swallows the NameError,
+            # so it never actually creates them).
+            try:
+                from hermes_cli.profiles import (
+                    profiles_to_serve as _pts,
+                    get_active_profile_name as _gap,
+                )
+                _active = _gap() or "default"
+                _served = [_active]
+                for _pname, _phome in _pts(multiplex=True):
+                    if _pname == _active:
+                        continue
+                    self._profile_adapters[_pname] = dict(self.adapters)
+                    _served.append(_pname)
+                try:
+                    from gateway.pairing import PairingStore as _PS
+                    for _pname in _served:
+                        if _pname and _pname not in self.pairing_stores:
+                            self.pairing_stores[_pname] = _PS(profile=_pname)
+                except Exception:
+                    logger.warning(
+                        "routing-only: could not create per-profile pairing stores",
+                        exc_info=True,
+                    )
+                logger.info(
+                    "Multiplex: routing-only mode — %d profile(s) registered on "
+                    "the shared adapters (%s); no secondary connections started.",
+                    len(_served) - 1,
+                    ", ".join(sorted(p.value for p in self.adapters)) or "none",
+                )
+            except Exception:
+                logger.error("routing-only registration failed", exc_info=True)
+            return 0
+
+
         try:
             from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
         except Exception:
@@ -9460,7 +9503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                        return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+                        return f"⏩ Steering — lands at the next tool call or pause: '{preview}'"
                     return "Steer rejected (empty payload)."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self._adapter_for_source(source)
@@ -18613,6 +18656,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
+            try:
+                from gateway import keryx_stream as _keryx_rc
+                _keryx_rc.attach_reasoning_callback(agent, source)
+            except Exception:
+                pass
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
@@ -20322,6 +20370,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 previewed=_previewed,
             )
             if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+                try:
+                    from gateway import keryx_stream as _keryx_r
+                    await _keryx_r.prepend_reasoning_to_streamed(self, source, response, _sc)
+                except Exception:
+                    pass
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",

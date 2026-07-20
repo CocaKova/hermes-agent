@@ -417,6 +417,31 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+_SILAS_PUBLIC_URL_HOST_CACHE = None
+
+
+def _silas_public_url_host() -> str:
+    # SILAS patch (silas_ext/reapply.py): hostname (lowercase, portless) from
+    # dashboard.public_url, so the Host check can accept requests forwarded by
+    # the local tailscale-serve HTTPS proxy. Cached — config edits already
+    # require a dashboard restart to take effect.
+    global _SILAS_PUBLIC_URL_HOST_CACHE
+    if _SILAS_PUBLIC_URL_HOST_CACHE is None:
+        host = ""
+        try:
+            from urllib.parse import urlsplit
+            cfg = load_config() or {}
+            url = ((cfg.get("dashboard") or {}).get("public_url") or "").strip()
+            if url:
+                if "//" not in url:
+                    url = "//" + url
+                host = (urlsplit(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        _SILAS_PUBLIC_URL_HOST_CACHE = host
+    return _SILAS_PUBLIC_URL_HOST_CACHE
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -455,7 +480,15 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        if host_only in _LOOPBACK_HOST_VALUES:
+            return True
+        # SILAS patch (silas_ext/reapply.py): tailscale serve terminates
+        # tailnet HTTPS on this machine and proxies to the loopback bind,
+        # forwarding the tailnet hostname as Host. Accept exactly the
+        # operator-configured dashboard.public_url hostname.
+        _silas_public_url_host_value = _silas_public_url_host()
+        return bool(_silas_public_url_host_value) and (
+            host_only == _silas_public_url_host_value)
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc

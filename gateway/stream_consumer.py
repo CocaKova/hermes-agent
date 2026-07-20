@@ -322,6 +322,11 @@ class GatewayStreamConsumer:
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
+        try:
+            from gateway import keryx_stream as _keryx
+            _keryx.publish_segment(self.adapter, self.chat_id)
+        except Exception:
+            pass
         self._queue.put(_NEW_SEGMENT)
 
     def on_commentary(self, text: str) -> None:
@@ -375,12 +380,22 @@ class GatewayStreamConsumer:
         appears below any tool-progress messages the gateway sent in between.
         """
         if text:
+            try:
+                from gateway import keryx_stream as _keryx
+                _keryx.publish_delta(self.adapter, self.chat_id, text)
+            except Exception:
+                pass
             self._queue.put(text)
         elif text is None:
             self.on_segment_break()
 
     def finish(self) -> None:
         """Signal that the stream is complete."""
+        try:
+            from gateway import keryx_stream as _keryx
+            _keryx.publish_stop(self.adapter, self.chat_id)
+        except Exception:
+            pass
         self._queue.put(_DONE)
 
     # ── Think-block filtering ────────────────────────────────────────
@@ -401,6 +416,16 @@ class GatewayStreamConsumer:
         """
         buf = self._think_buffer + text
         self._think_buffer = ""
+
+        # SILAS patch (silas_ext/reapply.py): a message can never start with blank lines.
+        # The agent's tool-boundary "\n\n" break plus a chat template's content-initial
+        # "\n\n" (Qwen3) otherwise commit as four leading newlines on every post-tool
+        # segment — the turn-initial lstrip in _fire_stream_delta only covers the FIRST
+        # delta of the whole turn, not each new per-segment message (live-caught 2026-07-09).
+        if not self._accumulated:
+            buf = buf.lstrip("\n")
+            if not buf:
+                return
 
         while buf:
             # Case-insensitive matching: models emit mixed-case tag
@@ -627,7 +652,15 @@ class GatewayStreamConsumer:
                     or got_segment_break
                     or commentary_text is not None
                 )
-                if not self.cfg.buffer_only:
+                _keryx_buffer_only = self.cfg.buffer_only
+                try:
+                    from gateway import keryx_stream as _keryx
+                    _keryx_buffer_only = _keryx.suppress_protocol_edits(
+                        self.adapter, self.chat_id, self.cfg.buffer_only
+                    )
+                except Exception:
+                    pass
+                if not _keryx_buffer_only:
                     should_edit = should_edit or (
                         (elapsed >= self._current_edit_interval
                             and self._accumulated)

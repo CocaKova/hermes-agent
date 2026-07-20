@@ -1133,6 +1133,493 @@ def sessions_prune(
 
 
 # ---------------------------------------------------------------------------
+# Toolset toggles (Keryx 1.16) — platform-aware toolset view + enable/disable.
+# The core `/v1/toolsets` reports the api_server platform's enablement, but
+# the agent Keryx chats with runs on platform_toolsets.<platform> (matrix by
+# default) — so the hub was showing state the agent doesn't actually have.
+# These routes read AND write the requested platform's list via the same
+# hermes helpers the desktop dashboard uses (`_get_platform_tools` /
+# `_save_platform_tools`), so all surfaces stay in lockstep. Edits are live
+# on the agent's next turn: the gateway re-resolves platform toolsets per
+# turn through the mtime-keyed config cache — no restart.
+#
+# Operators can pin the surface with two env vars (comma-separated toolset
+# names, read fresh per request so a .env change only needs the usual
+# gateway restart):
+#   KERYX_TOOLSETS_LOCKED     — cannot be DISABLED from the app
+#   KERYX_TOOLSETS_FORBIDDEN  — cannot be ENABLED from the app
+# Both surface as `locked: true` so the client greys the switch out instead
+# of offering a toggle that an external config guard would silently revert.
+# ---------------------------------------------------------------------------
+
+_TOOLSETS_DEFAULT_PLATFORM = "matrix"
+# config.yaml platform keys are simple identifiers; anything else is hostile.
+_PLATFORM_KEY_OK = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def _toolsets_env_set(var: str) -> set:
+    return {t.strip() for t in (os.environ.get(var) or "").split(",") if t.strip()}
+
+
+def _toolsets_platform(raw: str) -> str:
+    platform = (raw or "").strip().lower() or _TOOLSETS_DEFAULT_PLATFORM
+    if not _PLATFORM_KEY_OK.match(platform):
+        raise ValueError(f"invalid platform '{raw}'")
+    return platform
+
+
+def toolsets_snapshot(platform: str) -> dict:
+    """Payload for `GET /keryx/toolsets` — same entry shape as `/v1/toolsets`
+    plus `locked`, keyed to the requested platform's enablement."""
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import (
+        _get_effective_configurable_toolsets,
+        _get_platform_tools,
+        _toolset_has_keys,
+    )
+    from toolsets import resolve_toolset
+
+    locked = _toolsets_env_set("KERYX_TOOLSETS_LOCKED")
+    forbidden = _toolsets_env_set("KERYX_TOOLSETS_FORBIDDEN")
+    config = load_config()
+    enabled = set(
+        _get_platform_tools(config, platform, include_default_mcp_servers=False)
+    )
+    data = []
+    for name, label, desc in _get_effective_configurable_toolsets():
+        try:
+            tools = sorted(set(resolve_toolset(name)))
+        except Exception:
+            tools = []
+        data.append({
+            "name": name,
+            "label": label,
+            "description": desc,
+            "enabled": name in enabled,
+            "configured": _toolset_has_keys(name, config),
+            "locked": name in locked or name in forbidden,
+            "tools": tools,
+        })
+    return {"platform": platform, "canToggle": True, "data": data}
+
+
+def toolset_set_enabled(name: str, enabled: bool, platform: str) -> Tuple[int, dict]:
+    """`PUT /keryx/toolsets/{name}` — persist one toolset's enablement for a
+    platform. Refuses locked/forbidden changes so the app never makes an edit
+    that an operator guard (or hard rule) would revert behind the user's back."""
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import (
+        _get_effective_configurable_toolsets,
+        _get_platform_tools,
+        _save_platform_tools,
+    )
+
+    valid = {key for key, _, _ in _get_effective_configurable_toolsets()}
+    if name not in valid:
+        return 400, {"error": {"message": f"unknown toolset '{name}'"}}
+    if not enabled and name in _toolsets_env_set("KERYX_TOOLSETS_LOCKED"):
+        return 403, {"error": {"message": f"'{name}' is locked on and cannot be disabled here"}}
+    if enabled and name in _toolsets_env_set("KERYX_TOOLSETS_FORBIDDEN"):
+        return 403, {"error": {"message": f"'{name}' is locked off and cannot be enabled here"}}
+
+    config = load_config()
+    current = set(
+        _get_platform_tools(config, platform, include_default_mcp_servers=False)
+    )
+    if enabled:
+        current.add(name)
+    else:
+        current.discard(name)
+
+    # _save_platform_tools drops the `no_mcp` sentinel by design (the desktop
+    # picker treats saving as consent to re-enable MCP servers). A phone
+    # toggle of one toolset is no such consent — losing the sentinel would
+    # resurrect every default MCP server on this platform. Put it back.
+    raw_before = config.get("platform_toolsets", {}).get(platform) or []
+    had_no_mcp = "no_mcp" in raw_before
+    _save_platform_tools(config, platform, current)
+    if had_no_mcp and "no_mcp" not in config["platform_toolsets"][platform]:
+        from hermes_cli.config import save_config
+
+        config["platform_toolsets"][platform] = sorted(
+            set(config["platform_toolsets"][platform]) | {"no_mcp"}
+        )
+        save_config(config)
+    return 200, {"ok": True, "name": name, "enabled": enabled, "platform": platform}
+
+
+# ---------------------------------------------------------------------------
+# Gateway Controls (Keryx 1.21) — a curated, non-secret slice of config.yaml
+# the phone may adjust, plus the reasoning dial's write side, a redacted log
+# tail, and a config-driven brain picker. Everything persists through hermes'
+# own config helpers; secrets/.env are structurally out of reach because the
+# keys are whitelisted here, never taken from the request.
+# ---------------------------------------------------------------------------
+
+_CONFIG_KNOBS: Dict[str, Dict[str, Any]] = {
+    # -- Behavior ------------------------------------------------------------
+    "busy_input_mode": {
+        "section": "display", "path": ["busy_input_mode"], "kind": "enum",
+        "choices": ["queue", "steer", "interrupt"], "default": "interrupt",
+        "applies": "gateway restart", "label": "Busy input", "group": "Behavior",
+        "description": "What a new message does while the agent is mid-task: wait in line, steer the current run, or interrupt it.",
+    },
+    "max_turns": {
+        "section": "agent", "path": ["max_turns"], "kind": "int", "min": 1, "max": 500, "default": 90,
+        "applies": "next session", "label": "Max turns", "group": "Behavior",
+        "description": "How many agent turns one task may take before it must wrap up.",
+    },
+    # -- Display -------------------------------------------------------------
+    "show_reasoning": {
+        "section": "display", "path": ["show_reasoning"], "kind": "bool", "default": True,
+        "applies": "next turn", "label": "Reasoning blocks", "group": "Display",
+        "description": "Show the brain's \U0001F4AD reasoning above each answer.",
+    },
+    "streaming": {
+        "section": "display", "path": ["streaming"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Protocol streaming", "group": "Display",
+        "description": "Stream answers as message edits when no live side-channel is connected.",
+    },
+    "runtime_footer": {
+        "section": "display", "path": ["runtime_footer", "enabled"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Runtime footer", "group": "Display",
+        "description": "The model · context% · cwd line under each answer.",
+    },
+    "timestamps": {
+        "section": "display", "path": ["timestamps"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Timestamps", "group": "Display",
+        "description": "Stamp each message label with its time.",
+    },
+    "memory_notifications": {
+        "section": "display", "path": ["memory_notifications"], "kind": "enum",
+        "choices": ["off", "on", "verbose"], "default": "on",
+        "applies": "next turn", "label": "Memory notices", "group": "Display",
+        "description": "How loudly the agent announces memory updates: silent, a note, or the full preview.",
+    },
+    "tool_progress": {
+        "section": "display", "path": ["tool_progress"], "kind": "enum",
+        "choices": ["off", "new", "all", "verbose"], "default": "all",
+        "applies": "next turn", "label": "Tool progress", "group": "Display",
+        "description": "Which tool calls narrate while the agent works.",
+    },
+    "compact": {
+        "section": "display", "path": ["compact"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Compact output", "group": "Display",
+        "description": "Trim the agent's chrome to the essentials.",
+    },
+    # -- Missions (the kanban dispatcher re-reads config every tick, so these
+    #    land without a restart) --------------------------------------------
+    "missions_dispatch_interval": {
+        "section": "kanban", "path": ["dispatch_interval_seconds"], "kind": "int",
+        "min": 15, "max": 3600, "default": 60,
+        "applies": "next dispatch tick", "label": "Dispatch every", "group": "Missions",
+        "description": "Seconds between dispatcher ticks — how quickly ready missions get workers.",
+    },
+    "missions_failure_limit": {
+        "section": "kanban", "path": ["failure_limit"], "kind": "int",
+        "min": 1, "max": 10, "default": 2,
+        "applies": "next dispatch tick", "label": "Failure limit", "group": "Missions",
+        "description": "Consecutive failures before a mission is parked as blocked.",
+    },
+    "missions_auto_decompose": {
+        "section": "kanban", "path": ["auto_decompose"], "kind": "bool", "default": True,
+        "applies": "next dispatch tick", "label": "Auto-decompose", "group": "Missions",
+        "description": "Let the dispatcher break big missions into subtasks on its own.",
+    },
+    "missions_decompose_per_tick": {
+        "section": "kanban", "path": ["auto_decompose_per_tick"], "kind": "int",
+        "min": 1, "max": 10, "default": 3,
+        "applies": "next dispatch tick", "label": "Decompose per tick", "group": "Missions",
+        "description": "How many missions may be decomposed in one dispatcher pass.",
+    },
+    "missions_stale_timeout": {
+        "section": "kanban", "path": ["dispatch_stale_timeout_seconds"], "kind": "int",
+        "min": 600, "max": 86400, "default": 14400,
+        "applies": "next dispatch tick", "label": "Stale after", "group": "Missions",
+        "description": "Seconds a silent running mission may sit before the dispatcher calls it stale.",
+    },
+    "missions_default_assignee": {
+        "section": "kanban", "path": ["default_assignee"], "kind": "enum",
+        "choices_dynamic": "profiles", "default": "",
+        "applies": "next dispatch tick", "label": "Default assignee", "group": "Missions",
+        "description": "Which agent profile picks up missions that don't name one (blank = the dispatcher decides).",
+    },
+    "missions_orchestrator": {
+        "section": "kanban", "path": ["orchestrator_profile"], "kind": "enum",
+        "choices_dynamic": "profiles", "default": "",
+        "applies": "next dispatch tick", "label": "Orchestrator", "group": "Missions",
+        "description": "Profile that runs decompose/triage passes (blank = default brain).",
+    },
+    # -- Compression ---------------------------------------------------------
+    "compression_threshold": {
+        "section": "compression", "path": ["threshold"], "kind": "float",
+        "min": 0.3, "max": 0.9, "default": 0.7,
+        "applies": "next turn", "label": "Compress at", "group": "Compression",
+        "description": "Context fill fraction that triggers compression — lower compresses earlier.",
+    },
+    "compression_protect_last": {
+        "section": "compression", "path": ["protect_last_n"], "kind": "int",
+        "min": 10, "max": 200, "default": 40,
+        "applies": "next turn", "label": "Protect last", "group": "Compression",
+        "description": "Recent messages never summarized away.",
+    },
+    "compression_message_limit": {
+        "section": "compression", "path": ["hygiene_hard_message_limit"], "kind": "int",
+        "min": 100, "max": 2000, "default": 600,
+        "applies": "next turn", "label": "Message ceiling", "group": "Compression",
+        "description": "Hard cap on kept messages before hygiene trims the transcript.",
+    },
+}
+
+
+def _profile_choices() -> list:
+    """Dynamic enum choices for profile-shaped knobs: the routing map's named
+    profiles plus 'default' plus blank (= unset). Computed fresh per call so a
+    routing-map edit shows up without a payload change."""
+    profiles: list = []
+    try:
+        import yaml
+        from pathlib import Path
+
+        cfg = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+        rp = ((cfg.get("platforms") or {}).get("matrix") or {}).get("room_profile_map") or {}
+        if isinstance(rp, dict):
+            profiles = sorted({str(v) for v in rp.values() if v})
+    except Exception:
+        pass
+    if "default" not in profiles:
+        profiles.append("default")
+    return [""] + profiles
+
+
+def _knob_choices(spec: Dict[str, Any]) -> list:
+    if spec.get("choices_dynamic") == "profiles":
+        return _profile_choices()
+    return spec.get("choices") or []
+
+
+def _knob_value(cfg: dict, spec: Dict[str, Any]) -> Any:
+    node: Any = cfg.get(spec["section"]) or {}
+    for part in spec["path"][:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+        if node is None:
+            return None
+    return node.get(spec["path"][-1]) if isinstance(node, dict) else None
+
+
+def config_knobs_snapshot() -> dict:
+    """`GET /keryx/config` — the whitelisted knobs with live values + metadata."""
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    locked = _toolsets_env_set("KERYX_CONFIG_LOCKED")
+    knobs = []
+    for key, spec in _CONFIG_KNOBS.items():
+        value = _knob_value(cfg, spec)
+        if value is None:
+            value = spec["default"]
+        knobs.append({
+            "key": key,
+            "label": spec["label"],
+            "description": spec["description"],
+            "kind": spec["kind"],
+            "group": spec.get("group") or "Gateway",
+            "value": value,
+            "choices": _knob_choices(spec),
+            "min": spec.get("min"),
+            "max": spec.get("max"),
+            "applies": spec["applies"],
+            "locked": key in locked,
+        })
+    return {"knobs": knobs}
+
+
+def config_knob_set(key: Any, value: Any) -> Tuple[int, dict]:
+    """`PUT /keryx/config` — validate + persist ONE whitelisted knob."""
+    spec = _CONFIG_KNOBS.get(str(key or ""))
+    if spec is None:
+        return 400, {"error": {"message": f"unknown config key '{key}'"}}
+    if str(key) in _toolsets_env_set("KERYX_CONFIG_LOCKED"):
+        return 403, {"error": {"message": f"'{key}' is locked by the operator"}}
+    kind = spec["kind"]
+    if kind == "enum":
+        choices = _knob_choices(spec)
+        # Dynamic choices (profile names) keep their exact case; static tables
+        # are all-lowercase vocabularies, so normalize what the phone sent.
+        value = str(value or "").strip()
+        if not spec.get("choices_dynamic"):
+            value = value.lower()
+        if value not in choices:
+            shown = [c if c else "(blank)" for c in choices]
+            return 400, {"error": {"message": f"'{key}' must be one of: {', '.join(shown)}"}}
+    elif kind == "bool":
+        if not isinstance(value, bool):
+            return 400, {"error": {"message": f"'{key}' takes true/false"}}
+    elif kind == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return 400, {"error": {"message": f"'{key}' takes an integer"}}
+        if not (spec["min"] <= value <= spec["max"]):
+            return 400, {"error": {"message": f"'{key}' must be {spec['min']}–{spec['max']}"}}
+    elif kind == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 400, {"error": {"message": f"'{key}' takes a number"}}
+        value = float(value)
+        if not (spec["min"] <= value <= spec["max"]):
+            return 400, {"error": {"message": f"'{key}' must be {spec['min']}–{spec['max']}"}}
+    else:  # pragma: no cover - spec table is static
+        return 500, {"error": {"message": "bad knob spec"}}
+
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    node = cfg.setdefault(spec["section"], {})
+    for part in spec["path"][:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[spec["path"][-1]] = value
+    save_config(cfg)
+    return 200, {"ok": True, "key": key, "value": value, "applies": spec["applies"]}
+
+
+def reasoning_set(level: Any) -> Tuple[int, dict]:
+    """`PUT /keryx/reasoning` — persist the reasoning dial (write side of the
+    /keryx/capabilities read). Validates against what the ACTIVE brain accepts
+    (binary local brains take none/high; cloud takes the full effort scale)."""
+    caps = _reasoning_capabilities()
+    levels = caps.get("reasoning", {}).get("levels") or []
+    level = str(level or "").strip().lower()
+    if level not in levels:
+        return 400, {"error": {"message": f"level must be one of: {', '.join(levels)}"}}
+
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("agent", {})["reasoning_effort"] = level
+    save_config(cfg)
+    return 200, {"ok": True, "level": level, "applies": "next session"}
+
+
+def logs_tail(lines_q: str) -> Tuple[int, dict]:
+    """`GET /keryx/logs?lines=` — redacted tail of the gateway's own log.
+
+    journalctl first (systemd installs, --user then system), then plain log
+    files under ~/.hermes. Everything goes through the agent's own secret
+    redaction before it leaves the box; if redaction can't load, nothing does.
+    """
+    import subprocess
+
+    try:
+        lines = max(20, min(500, int(lines_q or 120)))
+    except (TypeError, ValueError):
+        lines = 120
+
+    text = ""
+    source = ""
+    unit = str(os.getenv("KERYX_LOGS_UNIT", "") or "hermes-gateway.service")
+    for scope_args in (["--user"], []):
+        try:
+            proc = subprocess.run(
+                ["journalctl", *scope_args, "-u", unit, "-n", str(lines), "--no-pager", "-o", "short-iso"],
+                capture_output=True, text=True, timeout=8,
+            )
+            if proc.returncode == 0 and proc.stdout.strip() and "-- No entries --" not in proc.stdout:
+                text, source = proc.stdout, "journal"
+                break
+        except Exception:
+            continue
+    if not text:
+        from pathlib import Path
+
+        for candidate in (Path.home() / ".hermes" / "logs" / "gateway.log",
+                          Path.home() / ".hermes" / "gateway.log"):
+            try:
+                if candidate.is_file():
+                    text = "\n".join(candidate.read_text(errors="replace").splitlines()[-lines:])
+                    source = "file"
+                    break
+            except Exception:
+                continue
+    if not text:
+        return 501, {"error": {"message": "no log source available on this install"}}
+
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text)
+    except Exception:
+        # Fail CLOSED: unredacted logs never leave the gateway.
+        return 500, {"error": {"message": "log redaction unavailable"}}
+    return 200, {"source": source, "lines": lines, "text": text}
+
+
+# One swap at a time; a second tap while vLLM is still booting only hurts.
+_BRAIN_SWAP_LAST: Dict[str, float] = {"ts": 0.0}
+_BRAIN_SWAP_COOLDOWN_S = 60.0
+
+
+def _brain_entries() -> List[Dict[str, str]]:
+    """Operator-configured brains (config.yaml `keryx.brains`, list of
+    {name, command, description?}). The COMMAND never leaves the gateway —
+    the phone only ever sees name + description."""
+    from hermes_cli.config import load_config
+
+    entries = []
+    for raw in ((load_config().get("keryx") or {}).get("brains") or []):
+        if isinstance(raw, dict) and str(raw.get("name") or "").strip() and str(raw.get("command") or "").strip():
+            entries.append({
+                "name": str(raw["name"]).strip(),
+                "command": str(raw["command"]).strip(),
+                "description": str(raw.get("description") or "").strip(),
+            })
+    return entries
+
+
+def brains_snapshot() -> dict:
+    """`GET /keryx/brains` — the picker list + what's actually serving now.
+    Empty list = unconfigured; clients hide the panel."""
+    caps = _reasoning_capabilities()
+    return {
+        "active": caps.get("model", ""),
+        "brains": [
+            {"name": e["name"], "description": e["description"]} for e in _brain_entries()
+        ],
+    }
+
+
+def brain_select(name: Any) -> Tuple[int, dict]:
+    """`POST /keryx/brain` — launch the operator's swap command for [name],
+    detached (a swap that restarts this gateway must not kill itself). The
+    answer is 202: watch `active` on /keryx/brains land on the new model."""
+    import subprocess
+    import time as _time
+
+    name = str(name or "").strip()
+    entry = next((e for e in _brain_entries() if e["name"] == name), None)
+    if entry is None:
+        return 404, {"error": {"message": f"unknown brain '{name}'"}}
+    now = _time.time()
+    if now - _BRAIN_SWAP_LAST["ts"] < _BRAIN_SWAP_COOLDOWN_S:
+        return 409, {"error": {"message": "a brain swap was just started — give it a minute"}}
+    _BRAIN_SWAP_LAST["ts"] = now
+
+    from pathlib import Path
+
+    log_dir = Path.home() / ".hermes" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = open(log_dir / "keryx-brain-swap.log", "ab")
+    log.write(f"\n--- {name} @ {_time.strftime('%Y-%m-%dT%H:%M:%S')} ---\n".encode())
+    subprocess.Popen(
+        ["bash", "-c", entry["command"]],
+        stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    return 202, {"ok": True, "started": name}
+
+
+# ---------------------------------------------------------------------------
 # Pet (Keryx 1.10) — the petdex mascot for the drawer header. Mirrors the
 # desktop/TUI `pet.info` payload built in tui_gateway/server.py, but reuses
 # only the engine (`agent.pet`): the phone renders the spritesheet itself.
@@ -1447,3 +1934,44 @@ def register_keryx_routes(router: Any, check_auth) -> None:
         return 200, sessions_prune(body)
 
     router.add_post("/keryx/sessions/prune", _make_json_handler(check_auth, _prune))
+
+    def _toolsets_get(request, body):
+        platform = _toolsets_platform(request.query.get("platform", ""))
+        return 200, toolsets_snapshot(platform)
+
+    def _toolset_put(request, body):
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("boolean 'enabled' is required")
+        platform = _toolsets_platform(str(body.get("platform") or ""))
+        return toolset_set_enabled(request.match_info["name"], enabled, platform)
+
+    router.add_get("/keryx/toolsets", _make_json_handler(check_auth, _toolsets_get))
+    router.add_put("/keryx/toolsets/{name}", _make_json_handler(check_auth, _toolset_put))
+
+    # --- Gateway Controls (Keryx 1.21) ------------------------------------
+
+    def _reasoning_put(request, body):
+        return reasoning_set(body.get("level"))
+
+    def _config_get(request, body):
+        return 200, config_knobs_snapshot()
+
+    def _config_put(request, body):
+        return config_knob_set(body.get("key"), body.get("value"))
+
+    def _logs_get(request, body):
+        return logs_tail(request.query.get("lines", ""))
+
+    def _brains_get(request, body):
+        return 200, brains_snapshot()
+
+    def _brain_post(request, body):
+        return brain_select(body.get("name"))
+
+    router.add_put("/keryx/reasoning", _make_json_handler(check_auth, _reasoning_put))
+    router.add_get("/keryx/config", _make_json_handler(check_auth, _config_get))
+    router.add_put("/keryx/config", _make_json_handler(check_auth, _config_put))
+    router.add_get("/keryx/logs", _make_json_handler(check_auth, _logs_get))
+    router.add_get("/keryx/brains", _make_json_handler(check_auth, _brains_get))
+    router.add_post("/keryx/brain", _make_json_handler(check_auth, _brain_post))

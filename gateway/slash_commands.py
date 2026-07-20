@@ -334,8 +334,28 @@ class GatewaySlashCommandsMixin:
         from hermes_constants import display_hermes_home
         from hermes_cli.profiles import get_active_profile_name
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        # SILAS_EXT_PROFILE_CMD_SOURCE: report the profile SERVING this source
+        # (room_profile_map / URL-prefix stamp), not the multiplexer's active
+        # profile — /profile in a persona room must name the persona. Gated
+        # on multiplex_profiles like _run_agent (upstream PR #62244).
+        _multiplexed = getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        )
+        source = getattr(event, "source", None)
+        profile_name = ""
+        if _multiplexed:
+            profile_name = (getattr(source, "profile", "") or "").strip()
+        profile_name = profile_name or get_active_profile_name()
+        if _multiplexed:
+            try:
+                from gateway.run import _profile_runtime_scope
+                _home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(_home):
+                    display = display_hermes_home()
+            except Exception:
+                display = display_hermes_home()
+        else:
+            display = display_hermes_home()
 
         lines = [
             t("gateway.profile.header", profile=profile_name),

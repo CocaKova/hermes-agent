@@ -48,7 +48,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
-        "execute_code",  # children should reason step-by-step, not write scripts
+        # SILAS_DELEGATE_EXECUTE_CODE_UNBLOCKED (2026-06-18): execute_code
+        # removed from the blocklist — delegated children may run code.
         "cronjob",  # no scheduling more work in the parent's name
     ]
 )
@@ -2916,24 +2917,33 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # SILAS patch (SILAS_DELEGATE_REJECT_AT_CAPACITY, silas_ext/reapply.py):
+        # Pool at capacity — REJECT the dispatch instead of silently running
+        # the whole batch synchronously. The sync fallback blocked the parent's
+        # turn for the full child runtime (195s observed 2026-07-10), and with
+        # busy_input_mode=queue that made the agent unreachable mid-delegation.
+        # Rejection is the documented contract in _get_max_async_children
+        # ("REJECTED (not queued)"). The built children never ran, so nothing
+        # was registered in the subagent registry; dropping them leaks nothing.
         logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
+            "delegate_task: async pool at capacity (%s); rejecting dispatch "
+            "so the parent turn stays free.",
             dispatch.get("error", "rejected"),
         )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        return json.dumps({
+            "status": "rejected",
+            "mode": "background",
+            "error": (
+                "Background delegation pool is at capacity "
+                f"({_get_max_async_children()} subagents already running). "
+                "This delegation was NOT started. Do NOT retry now and do NOT "
+                "wait or poll — the running subagents' results will re-enter "
+                "the conversation as new messages when they finish. Continue "
+                "with other work or end your turn, then delegate again after "
+                "a result arrives."
+            ),
+            "goals": _goals,
+        }, ensure_ascii=False)
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
@@ -3286,10 +3296,10 @@ def _build_top_level_description() -> str:
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
-        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "delegate_task, clarify, memory, send_message, cronjob.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, send_message, or execute_code. "
+        "cannot use clarify, memory, send_message, or cronjob. "
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"

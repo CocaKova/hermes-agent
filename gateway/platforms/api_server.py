@@ -4232,6 +4232,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            # SILAS patch (silas_ext/reapply.py): main-profile secret scope for
+            # API-server agent runs — mirrors gateway/run.py _profile_runtime_scope
+            # and the cron scheduler fix. Without it, multiplexing makes the first
+            # credential read (_resolve_openrouter_runtime) raise UnscopedSecretError.
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
+            from hermes_constants import get_hermes_home
+
+            _scope_token = set_secret_scope(
+                build_profile_secret_scope(get_hermes_home())
+            )
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4264,6 +4278,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                reset_secret_scope(_scope_token)
                 clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -4480,14 +4495,30 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                    gateway_session_key=gateway_session_key,
-                    route=route,
+                # SILAS patch (silas_ext/reapply.py): main-profile secret scope
+                # for the /v1/runs agent build — mirrors the _run_agent fix; the
+                # runs path constructs its agent inline and skipped the scope.
+                from agent.secret_scope import (
+                    build_profile_secret_scope,
+                    reset_secret_scope,
+                    set_secret_scope,
                 )
+                from hermes_constants import get_hermes_home
+
+                _runs_create_scope = set_secret_scope(
+                    build_profile_secret_scope(get_hermes_home())
+                )
+                try:
+                    agent = self._create_agent(
+                        ephemeral_system_prompt=ephemeral_system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=event_cb,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
+                finally:
+                    reset_secret_scope(_runs_create_scope)
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -4531,6 +4562,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    # SILAS patch (silas_ext/reapply.py): the executor thread does
+                    # not inherit the coroutine's contextvars — scope credentials
+                    # here too so lazy reads inside run_conversation stay bound.
+                    from agent.secret_scope import (
+                        build_profile_secret_scope,
+                        reset_secret_scope,
+                        set_secret_scope,
+                    )
+                    from hermes_constants import get_hermes_home
+
+                    _runs_sync_scope = set_secret_scope(
+                        build_profile_secret_scope(get_hermes_home())
+                    )
                     try:
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
@@ -4546,6 +4590,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     finally:
+                        reset_secret_scope(_runs_sync_scope)
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:
@@ -4974,6 +5019,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
+            try:
+                from gateway.keryx_stream import register_keryx_routes
+                register_keryx_routes(self._app.router, self._check_auth)
+            except Exception:
+                logger.debug("keryx routes unavailable", exc_info=True)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
