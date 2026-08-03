@@ -9814,6 +9814,17 @@ def cmd_update(args):
         managed_error,
     )
 
+    # SILAS_SAFE_UPDATE_GUARD (silas_ext/reapply.py): a raw update git-reset-hards
+    # away the 60+ patch SILAS layer. The ~/.local/bin/hermes shim already routes
+    # `hermes update` to silas-update; this guard covers every OTHER entry point
+    # (venv/bin/hermes directly, dashboard update button, in-chat relaunch).
+    if not getattr(args, "check", False) and os.environ.get("SILAS_RAW_UPDATE") != "1":
+        print("\u2717 raw `hermes update` is disabled on this install \u2014 it would wipe the SILAS patch layer.")
+        print("  safe flow : silas-update    (snapshot \u2192 anchor gate \u2192 update \u2192 battery \u2192 auto-rollback)")
+        print("  check only: hermes update --check")
+        print("  override  : SILAS_RAW_UPDATE=1 hermes update")
+        return
+
     # Deprecation notice for pip/Homebrew installs — printed before the
     # managed-mode early-return below so Homebrew users (who are blocked from
     # applying the update here) still see it. Warn, don't block: the update

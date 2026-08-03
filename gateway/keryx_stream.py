@@ -1029,6 +1029,174 @@ def skill_create(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Skill trash (Keryx 1.25) — deleting a skill from the phone, recoverably.
+#
+# The trash root deliberately lives OUTSIDE every skills root. Hiding it in a
+# dot-directory under ~/.hermes/skills would lean on the loader's exclusion set
+# (agent.skill_utils.EXCLUDED_SKILL_DIRS) happening to cover our name — it
+# covers .git/.archive/.hub and friends, NOT an arbitrary .trash — so a
+# "deleted" skill would quietly go on being loaded into the agent's system
+# prompt. Sitting outside the scanned roots makes that structurally impossible
+# rather than conventionally unlikely, and _assert_trash_isolated re-checks it
+# on every delete because skills.external_dirs is operator-configured and could
+# one day grow to contain us.
+# ---------------------------------------------------------------------------
+
+_TRASH_ID_BAD = re.compile(r"[/\\]|\.\.")
+
+
+def _skill_trash_root() -> Path:
+    """Sibling of the local skills dir, never inside it. Derived from the same
+    SKILLS_DIR the read/write paths already treat as authoritative, so the
+    trash follows a relocated skills root instead of drifting away from it."""
+    return _skill_manager().SKILLS_DIR.expanduser().resolve().parent / "keryx-skill-trash"
+
+
+def _assert_trash_isolated(root: Path) -> None:
+    """Refuse to trash anything while the trash root sits inside a scanned
+    skills root: the moved skill would still be discovered, so "deleted" would
+    be a lie. A failed delete is recoverable; a phantom skill is not obvious."""
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+    except Exception:
+        return
+    for skills_dir in get_all_skills_dirs():
+        if _is_under(root, skills_dir):
+            raise RuntimeError(
+                f"skill trash {root} sits inside skills root {skills_dir} — "
+                "refusing to delete (a trashed skill would stay live)"
+            )
+
+
+def _trash_entry_meta(entry: Path) -> Optional[Dict[str, Any]]:
+    try:
+        meta = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    meta["id"] = entry.name
+    # A restore lands back on the original path, so a skill recreated under the
+    # same name blocks it — tell the app up front instead of failing the tap.
+    origin = str(meta.get("origin") or "")
+    meta["restorable"] = bool(origin) and not Path(origin).exists()
+    return meta
+
+
+def skill_delete(name: str) -> Tuple[int, Dict[str, Any]]:
+    """Move a skill out of the scanned tree and into the trash. Recoverable via
+    skill_restore right up until it is purged."""
+    sm = _skill_manager()
+    skill_dir = _find_skill_dir(name)
+    if skill_dir is None:
+        return 404, {"error": {"message": f"unknown skill '{name}'"}}
+    # Same refusal as skill_write: external dirs are read-only to the phone.
+    if not _is_under(skill_dir, sm.SKILLS_DIR):
+        return 403, {
+            "error": {"message": "skill lives in a read-only external directory"}
+        }
+    origin = skill_dir.resolve()
+    skills_root = sm.SKILLS_DIR.resolve()
+    if origin == skills_root:
+        return 400, {"error": {"message": "refusing to delete the skills root"}}
+
+    root = _skill_trash_root()
+    _assert_trash_isolated(root)
+
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    entry = root / f"{origin.name}-{stamp}"
+    suffix = 1
+    while entry.exists():
+        suffix += 1
+        entry = root / f"{origin.name}-{stamp}-{suffix}"
+    entry.mkdir(parents=True)
+
+    rel = origin.relative_to(skills_root)
+    try:
+        shutil.move(str(skill_dir), str(entry / "skill"))
+    except OSError as e:
+        shutil.rmtree(entry, ignore_errors=True)
+        return 500, {"error": {"message": f"could not move skill to trash: {e}"}}
+    meta = {
+        "name": origin.name,
+        "category": rel.parts[0] if len(rel.parts) > 1 else None,
+        "origin": str(origin),
+        "deleted_at": stamp,
+    }
+    (entry / "entry.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _bust_skills_prompt_cache()
+    return 200, {
+        "ok": True,
+        "id": entry.name,
+        "name": origin.name,
+        "note": "moved to trash — restorable until purged; "
+        "skill index refreshes for new sessions",
+    }
+
+
+def skill_trash_list() -> Tuple[int, Dict[str, Any]]:
+    """Newest first — the thing you just deleted by mistake is at the top."""
+    root = _skill_trash_root()
+    if not root.is_dir():
+        return 200, {"entries": []}
+    entries = []
+    for entry in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
+        if not entry.is_dir():
+            continue
+        meta = _trash_entry_meta(entry)
+        if meta is not None:
+            entries.append(meta)
+    return 200, {"entries": entries}
+
+
+def skill_restore(entry_id: str) -> Tuple[int, Dict[str, Any]]:
+    if not entry_id or _TRASH_ID_BAD.search(entry_id):
+        return 400, {"error": {"message": "invalid trash id"}}
+    entry = _skill_trash_root() / entry_id
+    meta = _trash_entry_meta(entry) if entry.is_dir() else None
+    if meta is None:
+        return 404, {"error": {"message": f"unknown trash entry '{entry_id}'"}}
+    origin = Path(str(meta.get("origin") or ""))
+    if not str(origin) or not origin.is_absolute():
+        return 400, {"error": {"message": "trash entry has no usable origin path"}}
+    sm = _skill_manager()
+    if not _is_under(origin, sm.SKILLS_DIR):
+        return 403, {
+            "error": {"message": "trash entry points outside the skills directory"}
+        }
+    if origin.exists():
+        return 409, {
+            "error": {
+                "message": f"'{origin.name}' exists again — rename or delete it first"
+            }
+        }
+    origin.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(entry / "skill"), str(origin))
+    except OSError as e:
+        return 500, {"error": {"message": f"could not restore skill: {e}"}}
+    shutil.rmtree(entry, ignore_errors=True)
+    _bust_skills_prompt_cache()
+    return 200, {
+        "ok": True,
+        "name": origin.name,
+        "note": "restored — skill index refreshes for new sessions",
+    }
+
+
+def skill_purge(entry_id: str) -> Tuple[int, Dict[str, Any]]:
+    if not entry_id or _TRASH_ID_BAD.search(entry_id):
+        return 400, {"error": {"message": "invalid trash id"}}
+    entry = _skill_trash_root() / entry_id
+    if not entry.is_dir():
+        return 404, {"error": {"message": f"unknown trash entry '{entry_id}'"}}
+    shutil.rmtree(entry)
+    return 200, {"ok": True, "id": entry_id, "note": "purged for good"}
+
+
+# ---------------------------------------------------------------------------
 # Session prune (Keryx 1.8) — thin wrapper over hermes_state's new bulk
 # pruner, mirroring the dashboard's POST /api/sessions/prune body/response
 # byte-for-byte where it matters (the dashboard server is disabled on this
@@ -1353,21 +1521,312 @@ _CONFIG_KNOBS: Dict[str, Dict[str, Any]] = {
     # -- Compression ---------------------------------------------------------
     "compression_threshold": {
         "section": "compression", "path": ["threshold"], "kind": "float",
-        "min": 0.3, "max": 0.9, "default": 0.7,
+        "min": 0.3, "max": 0.9, "default": 0.5,
         "applies": "next turn", "label": "Compress at", "group": "Compression",
         "description": "Context fill fraction that triggers compression — lower compresses earlier.",
     },
     "compression_protect_last": {
         "section": "compression", "path": ["protect_last_n"], "kind": "int",
-        "min": 10, "max": 200, "default": 40,
+        "min": 10, "max": 200, "default": 20,
         "applies": "next turn", "label": "Protect last", "group": "Compression",
         "description": "Recent messages never summarized away.",
     },
     "compression_message_limit": {
         "section": "compression", "path": ["hygiene_hard_message_limit"], "kind": "int",
-        "min": 100, "max": 2000, "default": 600,
+        "min": 100, "max": 20000, "default": 5000,
         "applies": "next turn", "label": "Message ceiling", "group": "Compression",
         "description": "Hard cap on kept messages before hygiene trims the transcript.",
+    },
+    # -- Agent (Keryx 1.25) --------------------------------------------------
+    # Everything below this line is typed and range-checked. Settings whose
+    # vocabulary is open-ended (web.search_backend, context.engine — both
+    # resolve plugin names) deliberately get NO enum knob: a fixed choice list
+    # would go stale the moment a plugin is installed. Those live in the raw
+    # config editor, which validates the whole file instead of one field.
+    "agent_gateway_timeout": {
+        "section": "agent", "path": ["gateway_timeout"], "kind": "int",
+        "min": 30, "max": 3600, "default": 1800,
+        "applies": "gateway restart", "label": "Turn timeout", "group": "Agent",
+        "description": "Seconds one gateway turn may run before it is cut off.",
+    },
+    "agent_api_max_retries": {
+        "section": "agent", "path": ["api_max_retries"], "kind": "int",
+        "min": 0, "max": 10, "default": 3,
+        "applies": "next session", "label": "API retries", "group": "Agent",
+        "description": "How many times a failed model call is retried before the turn errors.",
+    },
+    "agent_task_completion_guidance": {
+        "section": "agent", "path": ["task_completion_guidance"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Completion guidance", "group": "Agent",
+        "description": "Nudge the agent to finish and summarize rather than trailing off.",
+    },
+    "agent_parallel_tool_guidance": {
+        "section": "agent", "path": ["parallel_tool_call_guidance"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Parallel tool guidance", "group": "Agent",
+        "description": "Encourage batching independent tool calls into one step.",
+    },
+    "agent_environment_probe": {
+        "section": "agent", "path": ["environment_probe"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Environment probe", "group": "Agent",
+        "description": "Let the agent inspect its shell environment at session start.",
+    },
+    # -- Tools ---------------------------------------------------------------
+    "tool_output_max_bytes": {
+        "section": "tool_output", "path": ["max_bytes"], "kind": "int",
+        "min": 1000, "max": 500000, "default": 50000,
+        "applies": "next turn", "label": "Output byte cap", "group": "Tools",
+        "description": "Largest tool result kept before it is truncated.",
+    },
+    "tool_output_max_lines": {
+        "section": "tool_output", "path": ["max_lines"], "kind": "int",
+        "min": 50, "max": 20000, "default": 2000,
+        "applies": "next turn", "label": "Output line cap", "group": "Tools",
+        "description": "Most lines a single tool result may contribute.",
+    },
+    "tool_output_max_line_length": {
+        "section": "tool_output", "path": ["max_line_length"], "kind": "int",
+        "min": 200, "max": 20000, "default": 2000,
+        "applies": "next turn", "label": "Line length cap", "group": "Tools",
+        "description": "Longest single line kept intact in tool output.",
+    },
+    "guardrails_warnings": {
+        "section": "tool_loop_guardrails", "path": ["warnings_enabled"], "kind": "bool", "default": True,
+        "applies": "next turn", "label": "Loop warnings", "group": "Tools",
+        "description": "Warn the agent when it repeats a failing tool call.",
+    },
+    "guardrails_hard_stop": {
+        "section": "tool_loop_guardrails", "path": ["hard_stop_enabled"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Loop hard stop", "group": "Tools",
+        "description": "Actually halt the run once a tool loop passes the hard-stop threshold.",
+    },
+    "guardrails_warn_after": {
+        "section": "tool_loop_guardrails", "path": ["warn_after", "exact_failure"], "kind": "int",
+        "min": 1, "max": 20, "default": 2,
+        "applies": "next turn", "label": "Warn after", "group": "Tools",
+        "description": "Identical failing calls before the first warning.",
+    },
+    "guardrails_stop_after": {
+        "section": "tool_loop_guardrails", "path": ["hard_stop_after", "exact_failure"], "kind": "int",
+        "min": 2, "max": 50, "default": 5,
+        "applies": "next turn", "label": "Stop after", "group": "Tools",
+        "description": "Identical failing calls before the run is halted.",
+    },
+    # -- Terminal ------------------------------------------------------------
+    "terminal_timeout": {
+        "section": "terminal", "path": ["timeout"], "kind": "int",
+        "min": 10, "max": 3600, "default": 180,
+        "applies": "next turn", "label": "Command timeout", "group": "Terminal",
+        "description": "Seconds a shell command may run before it is killed.",
+    },
+    "terminal_persistent_shell": {
+        "section": "terminal", "path": ["persistent_shell"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Persistent shell", "group": "Terminal",
+        "description": "Keep one shell alive across commands so cd and exports stick.",
+    },
+    "terminal_auto_source_bashrc": {
+        "section": "terminal", "path": ["auto_source_bashrc"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Source bashrc", "group": "Terminal",
+        "description": "Load your shell profile before running commands.",
+    },
+    "terminal_lifetime": {
+        "section": "terminal", "path": ["lifetime_seconds"], "kind": "int",
+        "min": 30, "max": 7200, "default": 300,
+        "applies": "next session", "label": "Shell lifetime", "group": "Terminal",
+        "description": "Seconds an idle persistent shell is kept before being recycled.",
+    },
+    # -- Browser -------------------------------------------------------------
+    "browser_inactivity_timeout": {
+        "section": "browser", "path": ["inactivity_timeout"], "kind": "int",
+        "min": 15, "max": 3600, "default": 120,
+        "applies": "next turn", "label": "Idle timeout", "group": "Browser",
+        "description": "Seconds an unused browser session stays open.",
+    },
+    "browser_command_timeout": {
+        "section": "browser", "path": ["command_timeout"], "kind": "int",
+        "min": 5, "max": 600, "default": 30,
+        "applies": "next turn", "label": "Action timeout", "group": "Browser",
+        "description": "Seconds a single browser action may take.",
+    },
+    "browser_allow_private_urls": {
+        "section": "browser", "path": ["allow_private_urls"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Allow private URLs", "group": "Browser",
+        "description": "Let the browser reach LAN and localhost addresses.",
+    },
+    "browser_record_sessions": {
+        "section": "browser", "path": ["record_sessions"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Record sessions", "group": "Browser",
+        "description": "Save a trace of each browsing session to disk.",
+    },
+    "browser_dialog_policy": {
+        "section": "browser", "path": ["dialog_policy"], "kind": "enum",
+        "choices": ["must_respond", "auto_dismiss", "auto_accept"], "default": "must_respond",
+        "applies": "next turn", "label": "Dialog policy", "group": "Browser",
+        "description": "What happens when a page throws an alert or confirm box.",
+    },
+    # -- Memory --------------------------------------------------------------
+    "memory_enabled": {
+        "section": "memory", "path": ["memory_enabled"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Memory", "group": "Memory",
+        "description": "Inject curated long-term memory into the system prompt.",
+    },
+    "memory_user_profile": {
+        "section": "memory", "path": ["user_profile_enabled"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "User profile", "group": "Memory",
+        "description": "Include the learned profile of you alongside memories.",
+    },
+    "memory_write_approval": {
+        "section": "memory", "path": ["write_approval"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Approve writes", "group": "Memory",
+        "description": "Ask before the agent adds, replaces, or removes a memory.",
+    },
+    "memory_char_limit": {
+        "section": "memory", "path": ["memory_char_limit"], "kind": "int",
+        "min": 500, "max": 50000, "default": 2200,
+        "applies": "next session", "label": "Memory budget", "group": "Memory",
+        "description": "Characters of memory allowed into the prompt.",
+    },
+    "memory_user_char_limit": {
+        "section": "memory", "path": ["user_char_limit"], "kind": "int",
+        "min": 250, "max": 25000, "default": 1375,
+        "applies": "next session", "label": "Profile budget", "group": "Memory",
+        "description": "Characters of user profile allowed into the prompt.",
+    },
+    # -- Skills --------------------------------------------------------------
+    "skills_write_approval": {
+        "section": "skills", "path": ["write_approval"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Approve skill writes", "group": "Skills",
+        "description": "Ask before the agent creates or edits a skill itself.",
+    },
+    "skills_guard_agent_created": {
+        "section": "skills", "path": ["guard_agent_created"], "kind": "bool", "default": False,
+        "applies": "next session", "label": "Guard agent-made skills", "group": "Skills",
+        "description": "Hold skills the agent wrote for review before they load.",
+    },
+    "skills_template_vars": {
+        "section": "skills", "path": ["template_vars"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Template vars", "group": "Skills",
+        "description": "Expand {{variables}} inside SKILL.md when loading.",
+    },
+    "skills_inline_shell": {
+        "section": "skills", "path": ["inline_shell"], "kind": "bool", "default": False,
+        "applies": "next session", "label": "Inline shell", "group": "Skills",
+        "description": "Let a skill run shell snippets while it loads. Off is safer.",
+    },
+    "skills_creation_nudge": {
+        "section": "skills", "path": ["creation_nudge_interval"], "kind": "int",
+        "min": 0, "max": 100, "default": 10,
+        "applies": "next session", "label": "Creation nudge", "group": "Skills",
+        "description": "Turns between reminders that a repeated task could become a skill (0 = never).",
+    },
+    "curator_enabled": {
+        "section": "curator", "path": ["enabled"], "kind": "bool", "default": True,
+        "applies": "gateway restart", "label": "Curator", "group": "Skills",
+        "description": "Let the curator groom the skill library on a schedule.",
+    },
+    "curator_interval_hours": {
+        "section": "curator", "path": ["interval_hours"], "kind": "int",
+        "min": 1, "max": 8760, "default": 168,
+        "applies": "gateway restart", "label": "Curate every", "group": "Skills",
+        "description": "Hours between curator passes.",
+    },
+    "curator_stale_days": {
+        "section": "curator", "path": ["stale_after_days"], "kind": "int",
+        "min": 1, "max": 3650, "default": 30,
+        "applies": "gateway restart", "label": "Stale after", "group": "Skills",
+        "description": "Days unused before a skill is flagged stale.",
+    },
+    "curator_archive_days": {
+        "section": "curator", "path": ["archive_after_days"], "kind": "int",
+        "min": 1, "max": 3650, "default": 90,
+        "applies": "gateway restart", "label": "Archive after", "group": "Skills",
+        "description": "Days unused before a stale skill is archived out of the prompt.",
+    },
+    # -- Delegation ----------------------------------------------------------
+    "delegation_orchestrator": {
+        "section": "delegation", "path": ["orchestrator_enabled"], "kind": "bool", "default": True,
+        "applies": "next session", "label": "Orchestrator", "group": "Delegation",
+        "description": "Allow the agent to spawn and coordinate subagents.",
+    },
+    "delegation_max_children": {
+        "section": "delegation", "path": ["max_concurrent_children"], "kind": "int",
+        "min": 1, "max": 16, "default": 3,
+        "applies": "next session", "label": "Concurrent subagents", "group": "Delegation",
+        "description": "How many subagents may run at once.",
+    },
+    "delegation_max_depth": {
+        "section": "delegation", "path": ["max_spawn_depth"], "kind": "int",
+        "min": 1, "max": 5, "default": 1,
+        "applies": "next session", "label": "Spawn depth", "group": "Delegation",
+        "description": "How many levels deep subagents may spawn their own subagents.",
+    },
+    "delegation_max_iterations": {
+        "section": "delegation", "path": ["max_iterations"], "kind": "int",
+        "min": 5, "max": 500, "default": 50,
+        "applies": "next session", "label": "Subagent turns", "group": "Delegation",
+        "description": "Turn ceiling for one subagent.",
+    },
+    "delegation_child_timeout": {
+        "section": "delegation", "path": ["child_timeout_seconds"], "kind": "int",
+        "min": 0, "max": 7200, "default": 0,
+        "applies": "next session", "label": "Subagent timeout", "group": "Delegation",
+        "description": "Seconds a subagent may run before it is cut off.",
+    },
+    "delegation_auto_approve": {
+        "section": "delegation", "path": ["subagent_auto_approve"], "kind": "bool", "default": False,
+        "applies": "next session", "label": "Auto-approve subagents", "group": "Delegation",
+        "description": "Skip approval prompts inside subagent runs.",
+    },
+    # -- Voice ---------------------------------------------------------------
+    "stt_enabled": {
+        "section": "stt", "path": ["enabled"], "kind": "bool", "default": True,
+        "applies": "gateway restart", "label": "Speech to text", "group": "Voice",
+        "description": "Transcribe voice notes sent to the agent.",
+    },
+    "voice_auto_tts": {
+        "section": "voice", "path": ["auto_tts"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Auto speak", "group": "Voice",
+        "description": "Read every answer aloud without being asked.",
+    },
+    "voice_max_recording": {
+        "section": "voice", "path": ["max_recording_seconds"], "kind": "int",
+        "min": 5, "max": 600, "default": 120,
+        "applies": "next turn", "label": "Recording cap", "group": "Voice",
+        "description": "Longest single voice capture.",
+    },
+    "voice_silence_duration": {
+        "section": "voice", "path": ["silence_duration"], "kind": "float",
+        "min": 0.5, "max": 30.0, "default": 3.0,
+        "applies": "next turn", "label": "End on silence", "group": "Voice",
+        "description": "Seconds of quiet that end a recording.",
+    },
+    # -- Safety --------------------------------------------------------------
+    "privacy_redact_pii": {
+        "section": "privacy", "path": ["redact_pii"], "kind": "bool", "default": False,
+        "applies": "next turn", "label": "Redact PII", "group": "Safety",
+        "description": "Strip personal identifiers from what leaves the box.",
+    },
+    "checkpoints_enabled": {
+        "section": "checkpoints", "path": ["enabled"], "kind": "bool", "default": False,
+        "applies": "next session", "label": "Checkpoints", "group": "Safety",
+        "description": "Snapshot files before the agent edits them, so changes can be rolled back.",
+    },
+    "checkpoints_max_snapshots": {
+        "section": "checkpoints", "path": ["max_snapshots"], "kind": "int",
+        "min": 1, "max": 500, "default": 20,
+        "applies": "next session", "label": "Keep snapshots", "group": "Safety",
+        "description": "How many checkpoints are retained before the oldest is pruned.",
+    },
+    "checkpoints_retention_days": {
+        "section": "checkpoints", "path": ["retention_days"], "kind": "int",
+        "min": 1, "max": 365, "default": 7,
+        "applies": "next session", "label": "Keep for", "group": "Safety",
+        "description": "Days a checkpoint survives before auto-pruning.",
+    },
+    "human_delay_mode": {
+        "section": "human_delay", "path": ["mode"], "kind": "enum",
+        "choices": ["off", "natural"], "default": "off",
+        "applies": "next turn", "label": "Human delay", "group": "Safety",
+        "description": "Pace replies at human speed instead of answering instantly.",
     },
 }
 
@@ -1482,6 +1941,159 @@ def config_knob_set(key: Any, value: Any) -> Tuple[int, dict]:
     node[spec["path"][-1]] = value
     save_config(cfg)
     return 200, {"ok": True, "key": key, "value": value, "applies": spec["applies"]}
+
+
+# ---------------------------------------------------------------------------
+# Raw config editor (Keryx 1.25) — the escape hatch under the curated knobs.
+#
+# The knob table can only ever cover settings someone wrote a spec for; this
+# hands the whole config.yaml to the phone. Every write is guarded because a
+# phone is a bad place to edit YAML: the text must parse, it must parse to a
+# mapping, load_config() must accept it, and a backup is taken first so a bad
+# save is always one restore away. The optional base_hash makes a save fail
+# loudly rather than silently clobbering an edit made elsewhere in between.
+# ---------------------------------------------------------------------------
+
+# A truncated paste is the realistic phone failure: select-all, fumble, save a
+# fragment. Losing most of the file's top-level sections is treated as an
+# accident and refused unless the caller explicitly confirms.
+_CONFIG_SECTION_LOSS_GUARD = 0.5
+_CONFIG_MAX_BYTES = 2_000_000
+
+
+def _config_path() -> Path:
+    from hermes_constants import get_config_path
+
+    return Path(get_config_path())
+
+
+def _config_hash(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def config_raw_get() -> Tuple[int, dict]:
+    """`GET /keryx/config/raw` — the file as text, plus the hash a later PUT
+    should echo back so a concurrent edit can be detected."""
+    path = _config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return 500, {"error": {"message": f"could not read {path}: {e}"}}
+    return 200, {
+        "content": text,
+        "hash": _config_hash(text),
+        "path": str(path),
+        "bytes": len(text.encode("utf-8")),
+    }
+
+
+def config_raw_put(body: Dict[str, Any]) -> Tuple[int, dict]:
+    """`PUT /keryx/config/raw` — validate, back up, write, verify, roll back."""
+    import os
+
+    import yaml
+
+    content = body.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return 400, {"error": {"message": "content is required"}}
+    if len(content.encode("utf-8")) > _CONFIG_MAX_BYTES:
+        return 400, {"error": {"message": "config is implausibly large — refusing"}}
+
+    path = _config_path()
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+
+    base_hash = str(body.get("base_hash") or "")
+    if base_hash and current and base_hash != _config_hash(current):
+        return 409, {
+            "error": {
+                "message": "config.yaml changed on the server since you opened it — "
+                "reload before saving"
+            }
+        }
+
+    try:
+        parsed = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        # PyYAML's message carries line/column — the app shows it verbatim.
+        return 400, {"error": {"message": f"YAML error: {e}"}}
+    if not isinstance(parsed, dict):
+        return 400, {
+            "error": {"message": "config must be a mapping of top-level sections"}
+        }
+
+    if not body.get("force"):
+        try:
+            before = yaml.safe_load(current) if current.strip() else None
+        except yaml.YAMLError:
+            before = None
+        if isinstance(before, dict) and before:
+            kept = set(parsed) & set(before)
+            if len(kept) < len(before) * _CONFIG_SECTION_LOSS_GUARD:
+                lost = sorted(set(before) - set(parsed))
+                return 409, {
+                    "error": {
+                        "message": "this save drops most of the file "
+                        f"({len(before) - len(kept)} of {len(before)} sections, "
+                        f"including {', '.join(lost[:5])}). Send force to confirm.",
+                        "needs_force": True,
+                    }
+                }
+
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak.keryx-{stamp}")
+    try:
+        if current:
+            backup.write_text(current, encoding="utf-8")
+    except OSError as e:
+        return 500, {"error": {"message": f"could not write backup: {e}"}}
+
+    tmp = path.with_name(f".{path.name}.keryx-tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return 500, {"error": {"message": f"could not write config: {e}"}}
+
+    # Last gate: Hermes' own loader has to accept the file. It knows things
+    # yaml.safe_load doesn't (schema coercion, required shapes), so this is
+    # where a syntactically fine but semantically broken config is caught —
+    # while the backup is still one os.replace away.
+    try:
+        from hermes_cli.config import load_config
+
+        load_config()
+    except Exception as e:
+        try:
+            if current:
+                path.write_text(current, encoding="utf-8")
+        except OSError:
+            logger.exception("config rollback failed — backup at %s", backup)
+            return 500, {
+                "error": {
+                    "message": f"config was rejected AND rollback failed. "
+                    f"Restore by hand from {backup}. ({e})"
+                }
+            }
+        return 400, {
+            "error": {
+                "message": f"Hermes rejected that config, so it was rolled back: {e}"
+            }
+        }
+
+    return 200, {
+        "ok": True,
+        "hash": _config_hash(content),
+        "backup": str(backup),
+        "applies": "gateway restart for most sections",
+    }
 
 
 def reasoning_set(level: Any) -> Tuple[int, dict]:
@@ -1926,9 +2538,36 @@ def register_keryx_routes(router: Any, check_auth) -> None:
     def _skill_post(request, body):
         return skill_create(body)
 
+    def _skill_delete(request, body):
+        name = request.match_info["name"]
+        if _SKILL_NAME_BAD.search(name):
+            return 400, {"error": {"message": "invalid skill name"}}
+        return skill_delete(name)
+
+    def _skill_trash_get(request, body):
+        return skill_trash_list()
+
+    def _skill_restore(request, body):
+        return skill_restore(request.match_info["entry_id"])
+
+    def _skill_purge(request, body):
+        return skill_purge(request.match_info["entry_id"])
+
     router.add_get("/keryx/skills/{name}", _make_json_handler(check_auth, _skill_get))
     router.add_put("/keryx/skills/{name}", _make_json_handler(check_auth, _skill_put))
     router.add_post("/keryx/skills", _make_json_handler(check_auth, _skill_post))
+    router.add_delete("/keryx/skills/{name}", _make_json_handler(check_auth, _skill_delete))
+    # Trash rides its own prefix rather than /keryx/skills/trash: that path only
+    # resolves while it stays registered ahead of /keryx/skills/{name}, and a
+    # later reorder would silently start treating "trash" as a skill name.
+    router.add_get("/keryx/skill-trash", _make_json_handler(check_auth, _skill_trash_get))
+    router.add_post(
+        "/keryx/skill-trash/{entry_id}/restore",
+        _make_json_handler(check_auth, _skill_restore),
+    )
+    router.add_delete(
+        "/keryx/skill-trash/{entry_id}", _make_json_handler(check_auth, _skill_purge)
+    )
 
     def _prune(request, body):
         return 200, sessions_prune(body)
@@ -1969,9 +2608,17 @@ def register_keryx_routes(router: Any, check_auth) -> None:
     def _brain_post(request, body):
         return brain_select(body.get("name"))
 
+    def _config_raw_get(request, body):
+        return config_raw_get()
+
+    def _config_raw_put(request, body):
+        return config_raw_put(body)
+
     router.add_put("/keryx/reasoning", _make_json_handler(check_auth, _reasoning_put))
     router.add_get("/keryx/config", _make_json_handler(check_auth, _config_get))
     router.add_put("/keryx/config", _make_json_handler(check_auth, _config_put))
+    router.add_get("/keryx/config/raw", _make_json_handler(check_auth, _config_raw_get))
+    router.add_put("/keryx/config/raw", _make_json_handler(check_auth, _config_raw_put))
     router.add_get("/keryx/logs", _make_json_handler(check_auth, _logs_get))
     router.add_get("/keryx/brains", _make_json_handler(check_auth, _brains_get))
     router.add_post("/keryx/brain", _make_json_handler(check_auth, _brain_post))

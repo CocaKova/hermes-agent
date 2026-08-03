@@ -65,10 +65,15 @@ def compose_user_api_content(
     if not isinstance(content, str):
         return None
     injections = []
-    if ext_prefetch_cache:
-        fenced = build_memory_context_block(ext_prefetch_cache)
-        if fenced:
-            injections.append(fenced)
+    # SILAS patch (silas_ext/reapply.py): external recalled memory is
+    # NO LONGER glued onto the user message. On a short user turn
+    # ("can you see this?") a small local brain answered the recalled
+    # <memory-context> block instead of the actual message. It is now
+    # merged into the leading system message at the system-assembly
+    # site in conversation_loop. (Merged, not a 2nd system message — the
+    # Qwen3 chat template rejects a non-leading system: "must be at the
+    # beginning".) ext_prefetch_cache stays in the signature so callers
+    # and the sidecar contract are unchanged.
     if plugin_user_context:
         injections.append(plugin_user_context)
     if not injections:

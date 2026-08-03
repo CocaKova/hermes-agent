@@ -2719,6 +2719,29 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id, sender, event_id, event_ts, source_content, relates_to
             )
 
+    def _room_profile(self, room_id: str) -> str:
+        """room_id -> profile dir name from platforms.matrix.room_profile_map.
+
+        SILAS patch (silas_ext/reapply.py). Reads the raw config.yaml because
+        PlatformConfig silently drops unknown keys. Cached after first load.
+        """
+        cache = getattr(self, "_room_profile_map_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                import yaml as _yaml
+                _cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+                with open(_cfg_path, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                _m = (((_raw.get("platforms") or {}).get("matrix") or {})
+                      .get("room_profile_map") or {})
+                if isinstance(_m, dict):
+                    cache = {str(k): str(v) for k, v in _m.items()}
+            except Exception as exc:
+                logger.warning("Matrix: room_profile_map load failed: %s", exc)
+            self._room_profile_map_cache = cache
+        return cache.get(room_id, "")
+
     async def _resolve_message_context(
         self,
         room_id: str,
@@ -2833,6 +2856,14 @@ class MatrixAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
+        _profile = self._room_profile(room_id)
+        if _profile and _profile != "default":
+            source.profile = _profile
+            logger.info(
+                "Matrix: routing message from room %s to profile %s",
+                room_id, _profile,
+            )
+
         self._background_read_receipt(room_id, event_id)
 
         return body, is_dm, chat_type, thread_id, display_name, source
@@ -2921,6 +2952,12 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> None:
         """Process a media message event (image, audio, video, file)."""
         body = source_content.get("body", "") or ""
+        # SILAS_EXT_MSC2530_XPORT_NAME: MSC2530 "filename" is the authoritative
+        # transport filename; body then carries the user caption. Legacy clients
+        # never send "filename" and put the filename in body. Resolved here so
+        # the cache block below never consumes a caption as a filename.
+        declared_filename = str(source_content.get("filename") or "").strip()
+        transport_filename = declared_filename or body
         url = source_content.get("url", "")
         if url and not str(url).startswith("mxc://"):
             logger.warning(
@@ -3056,9 +3093,9 @@ class MatrixAdapter(BasePlatformAdapter):
                             cached_path = cache_image_from_bytes(file_bytes, ext=ext)
                             logger.info("[Matrix] Cached user image at %s", cached_path)
                         elif msg_type in {MessageType.AUDIO, MessageType.VOICE}:
-                            ext = (
+                            ext = (  # SILAS_EXT_MSC2530_CACHE_EXT
                                 Path(
-                                    body
+                                    transport_filename
                                     or (
                                         "voice.ogg" if is_voice_message else "audio.ogg"
                                     )
@@ -3067,7 +3104,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
                             cached_path = cache_audio_from_bytes(file_bytes, ext=ext)
                         else:
-                            filename = body or (
+                            filename = transport_filename or (  # SILAS_EXT_MSC2530_CACHE_NAME
                                 "video.mp4"
                                 if msg_type == MessageType.VIDEO
                                 else "document"
@@ -3090,7 +3127,16 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         body, is_dm, chat_type, thread_id, display_name, source = ctx
 
-        if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
+        # MSC2530 (SILAS_EXT_MSC2530_CAPTIONS): a top-level "filename" field marks the
+        # transport name; the body is a user-typed caption only when it differs. This is
+        # authoritative — even a caption that *looks* like a filename (e.g. "screenshot.png")
+        # is kept when the sender declared a different real filename. The old suffix
+        # heuristic remains only for legacy clients that never send "filename".
+        declared_filename = str(source_content.get("filename") or "").strip()
+        if declared_filename:
+            if body.strip() == declared_filename:
+                body = ""
+        elif msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
 
         allow_http_fallback = bool(http_url) and not is_encrypted_media

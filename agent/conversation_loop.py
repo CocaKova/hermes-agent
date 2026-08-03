@@ -301,6 +301,97 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return False
 
 
+# SILAS_SKILL_HINTS_HELPER (silas_ext/reapply.py): turn->skills keyword bridge.
+# The local brain reliably reads recalled memory but skips the 150-entry
+# <available_skills> index, so the 1-3 relevant skills are surfaced per-turn
+# next to the recall injection (see the skill-hints injection site below). The
+# snapshot is mtime-cached; aliases map everyday words to skills whose
+# descriptions do not contain them (e.g. "resume" -> google-workspace/Drive).
+_SILAS_SKILL_CACHE = {"mtime": 0.0, "skills": []}
+_SILAS_SKILL_ALIASES = {
+    "google-workspace": ("resume", "cv", "document", "documents", "file", "files",
+                         "spreadsheet", "appointment", "appointments", "schedule",
+                         "meeting", "meetings", "inbox", "mail", "email", "emails",
+                         "attachment", "attachments"),
+    "business-ops": ("invoice", "invoices", "quote", "quotes", "proposal", "client",
+                     "clients", "lead", "leads", "customer", "customers"),
+    "financial-budget": ("budget", "savings", "spending", "transactions", "balance"),
+}
+_SILAS_SKILL_STOP = frozenset(
+    "the a an and or of to in on for with from via my your his her its our their "
+    "can could you please i me we it is are was were be been what when where how "
+    "which who why find get make do does did have has had this that these those "
+    "new use using used other any all some skills skill tools tool manage create "
+    "managing creating build building check checks checking look looking see send "
+    "sending show tell give take run help need want know think going come got today "
+    "tomorrow tonight yesterday now just like also about at as by so not no up out "
+    "off over".split()
+)
+
+
+def _silas_skill_words(text):
+    import re as _re
+    return set(_re.findall(r"[a-z0-9][a-z0-9-]+", text.lower())) - _SILAS_SKILL_STOP
+
+
+def _silas_skill_hints_block(api_messages, prefetch):
+    import json as _json
+    import os as _os
+    path = _os.path.expanduser("~/.hermes/.skills_prompt_snapshot.json")
+    try:
+        mtime = _os.path.getmtime(path)
+    except OSError:
+        return ""
+    if mtime != _SILAS_SKILL_CACHE["mtime"]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                entries = _json.load(fh).get("skills") or []
+        except Exception:
+            return ""
+        skills = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("frontmatter_name") or e.get("skill_name") or "")
+            if not name:
+                continue
+            desc = str(e.get("description") or "")
+            words = _silas_skill_words(name + " " + desc + " " + str(e.get("category") or ""))
+            name_words = _silas_skill_words(name.replace("-", " ") + " " + name)
+            alias_words = set(_SILAS_SKILL_ALIASES.get(name, ()))
+            skills.append((name, desc, words, name_words, alias_words))
+        _SILAS_SKILL_CACHE["skills"] = skills
+        _SILAS_SKILL_CACHE["mtime"] = mtime
+    parts = []
+    for _m in reversed(api_messages):
+        if isinstance(_m, dict) and _m.get("role") == "user":
+            _c = _m.get("content")
+            if isinstance(_c, str):
+                parts.append(_c)
+            elif isinstance(_c, list):
+                parts.extend(str(p.get("text") or "") for p in _c if isinstance(p, dict))
+            break
+    if prefetch:
+        parts.append(str(prefetch))
+    query = _silas_skill_words(" ".join(parts))
+    if not query:
+        return ""
+    scored = []
+    for name, desc, words, name_words, alias_words in _SILAS_SKILL_CACHE["skills"]:
+        score = (len(query & words)
+                 + 2 * len(query & name_words)
+                 + 2 * len(query & alias_words))
+        if score >= 2:
+            scored.append((score, name, desc))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    lines = ["- %s: %s" % (n, d) if d else "- %s" % n for _, n, d in scored[:3]]
+    return ("<skill-hints>\nSkills that look relevant to this request — load with "
+            "skill_view(name) BEFORE answering from memory or searching the "
+            "filesystem:\n" + "\n".join(lines) + "\n</skill-hints>")
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -958,6 +1049,40 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        # SILAS patch (silas_ext/reapply.py): external recalled memory is merged
+        # into the leading system message instead of the user message (small local
+        # brains answered the recalled block on short turns). Merged into the
+        # single leading system message because the Qwen3 template rejects a
+        # non-leading system message. When Anthropic prompt caching is active
+        # (Claude providers), keep the stable system cache prefix and fall back to
+        # attaching the block to the current user message instead.
+        if _ext_prefetch_cache:
+            # v0.19.0: conversation_loop no longer imports this — upstream moved the
+            # user-message composition (and the import) into agent/turn_context.py.
+            # Import locally from its home module so this site stays self-contained.
+            from agent.memory_manager import build_memory_context_block
+            _mem_block = build_memory_context_block(_ext_prefetch_cache)
+            if _mem_block:
+                if getattr(agent, "_use_prompt_caching", False):
+                    for _m in reversed(api_messages):
+                        if _m.get("role") == "user":
+                            _b = _m.get("content", "")
+                            if isinstance(_b, str):
+                                _m["content"] = _b + "\n\n" + _mem_block
+                            break
+                else:
+                    effective_system = (effective_system + "\n\n" + _mem_block).strip()
+        # SILAS_SKILL_HINTS_INJECT (silas_ext/reapply.py): surface the few skills
+        # relevant to this turn right where recall lands — the local brain reads
+        # memory but skips the 150-skill index. Skipped under Anthropic prompt
+        # caching to keep the system cache prefix byte-stable.
+        if not getattr(agent, "_use_prompt_caching", False):
+            try:
+                _skill_hints = _silas_skill_hints_block(api_messages, _ext_prefetch_cache)
+            except Exception:
+                _skill_hints = ""
+            if _skill_hints:
+                effective_system = (effective_system + "\n\n" + _skill_hints).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
