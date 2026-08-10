@@ -201,7 +201,9 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
-        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "Send a message to a connected messaging platform, or list available targets.\n"
+        "Also the reaction tool: action='react' attaches an emoji tapback to a chat "
+        "message — when the user asks you to react to a message, THIS is the tool.\n\n"
         "IMPORTANT: When the user asks to send to a specific channel or person "
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
@@ -214,7 +216,7 @@ SEND_MESSAGE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (supported on matrix and photon/iMessage; defaults to the message being answered — no message_id needed). 'unreact' retracts a previously-added reaction."
             },
             "target": {
                 "type": "string",
@@ -2114,3 +2116,116 @@ from tools.registry import tool_error
 #   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
 # Those callers import the helpers directly; none of them need the registry
 # entry.
+
+
+# SILAS_EXT_FLAT_REACT_TOOL (silas_ext/reapply.py): see manifest comment there.
+
+def _flat_react_check():
+    try:
+        from gateway.session_context import get_session_env
+        return (get_session_env("HERMES_SESSION_PLATFORM", "") or "") in (
+            "matrix",
+            "photon",
+        )
+    except Exception:
+        return False
+
+
+def _flat_react_tool(args, **kw):
+    # Scheduled onto the GATEWAY's loop (run_coroutine_threadsafe, the
+    # run.py:_event_callback_sync precedent) — the matrix client's HTTP
+    # session is bound to that loop, so _run_async's per-thread loop makes
+    # every send die inside _send_reaction's except (seen live 2026-08-03:
+    # a perfect react call returning "reaction send failed").
+    from gateway.session_context import get_session_env
+
+    platform_name = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+    if not platform_name:
+        return tool_error("react needs a live chat session")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+    if runner is None:
+        return tool_error("react requires the running gateway")
+    try:
+        adapter = runner.adapters.get(Platform(platform_name))
+    except Exception:
+        adapter = None
+    if adapter is None or not callable(getattr(adapter, "add_reaction", None)):
+        return tool_error(f"platform '{platform_name}' has no live reaction support")
+
+    emoji = (args.get("emoji") or "").strip()
+    message_id = str(args.get("message_id") or "").strip() or None
+    if emoji:
+        coro = adapter.add_reaction(chat_id=chat_id, emoji=emoji, message_id=message_id)
+    else:
+        coro = adapter.remove_reaction(chat_id=chat_id, message_id=message_id)
+
+    loop = getattr(runner, "_gateway_loop", None)
+    try:
+        if loop is not None and loop.is_running():
+            result = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=20)
+        else:
+            from model_tools import _run_async
+            result = _run_async(coro)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"reaction failed: {e}"})
+    if isinstance(result, dict):
+        return json.dumps(result)
+    return json.dumps({"success": bool(result)})
+
+
+FLAT_REACT_SCHEMA = {
+    "name": "react",
+    "description": (
+        "React to a message in the current chat with an emoji tapback, like "
+        "tapping \u2764\ufe0f on a phone. Targets the message you are answering "
+        "unless message_id says otherwise. Reach for it on your own, not only "
+        "when asked \u2014 but a reaction ADDS to your reply, it never replaces "
+        "it; always still answer in text:\n"
+        "- Simple acks ('sounds good', 'done', 'thanks') \u2014 \U0001f44d "
+        "plus a brief text reply.\n"
+        "- Something deserves warmth on top of your reply \u2014 \U0001f602 a "
+        "joke, \u2764\ufe0f good news or a photo \u2014 react first, then write "
+        "the reply.\n"
+        "- You are starting a longer task \u2014 a quick \U0001f44d says 'on "
+        "it', then report as usual.\n"
+        "Norms: at most one reaction per message; match the register "
+        "(\U0001f525 for wins, \U0001f602 only if genuinely funny); most "
+        "messages need none at all. This is not a text message and not a reply "
+        "\u2014 never narrate that you reacted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "emoji": {
+                "type": "string",
+                "description": "The emoji to react with, e.g. '\u2764\ufe0f' or '\U0001f525'. Empty string retracts your reaction.",
+            },
+            "message_id": {
+                "type": "string",
+                "description": "Optional: react to a specific earlier message instead of the current one.",
+            },
+        },
+        "required": ["emoji"],
+    },
+}
+
+# Bare top-level registry.register — tool discovery's AST scan only counts
+# module-body calls spelled exactly this way (try-wrapped or aliased forms are
+# invisible to _module_registers_tools and the module never gets imported).
+from tools.registry import registry
+
+registry.register(
+    name="react",
+    toolset="messaging",
+    schema=FLAT_REACT_SCHEMA,
+    handler=_flat_react_tool,
+    check_fn=_flat_react_check,
+    emoji="\U0001f49b",
+)
