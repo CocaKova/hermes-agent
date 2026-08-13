@@ -3309,6 +3309,29 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id, sender, event_id, event_ts, source_content, relates_to
             )
 
+    def _room_profile(self, room_id: str) -> str:
+        """room_id -> profile dir name from platforms.matrix.room_profile_map.
+
+        SILAS patch (silas_ext/reapply.py). Reads the raw config.yaml because
+        PlatformConfig silently drops unknown keys. Cached after first load.
+        """
+        cache = getattr(self, "_room_profile_map_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                import yaml as _yaml
+                _cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+                with open(_cfg_path, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                _m = (((_raw.get("platforms") or {}).get("matrix") or {})
+                      .get("room_profile_map") or {})
+                if isinstance(_m, dict):
+                    cache = {str(k): str(v) for k, v in _m.items()}
+            except Exception as exc:
+                logger.warning("Matrix: room_profile_map load failed: %s", exc)
+            self._room_profile_map_cache = cache
+        return cache.get(room_id, "")
+
     async def _resolve_message_context(
         self,
         room_id: str,
@@ -3423,6 +3446,14 @@ class MatrixAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
+        _profile = self._room_profile(room_id)
+        if _profile and _profile != "default":
+            source.profile = _profile
+            logger.info(
+                "Matrix: routing message from room %s to profile %s",
+                room_id, _profile,
+            )
+
         self._background_read_receipt(room_id, event_id)
 
         return body, is_dm, chat_type, thread_id, display_name, source
@@ -3523,6 +3554,12 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> None:
         """Process a media message event (image, audio, video, file)."""
         body = source_content.get("body", "") or ""
+        # SILAS_EXT_MSC2530_XPORT_NAME: MSC2530 "filename" is the authoritative
+        # transport filename; body then carries the user caption. Legacy clients
+        # never send "filename" and put the filename in body. Resolved here so
+        # the cache block below never consumes a caption as a filename.
+        declared_filename = str(source_content.get("filename") or "").strip()
+        transport_filename = declared_filename or body
         url = source_content.get("url", "")
         if url and not str(url).startswith("mxc://"):
             logger.warning(
@@ -3658,9 +3695,9 @@ class MatrixAdapter(BasePlatformAdapter):
                             cached_path = cache_image_from_bytes(file_bytes, ext=ext)
                             logger.info("[Matrix] Cached user image at %s", cached_path)
                         elif msg_type in {MessageType.AUDIO, MessageType.VOICE}:
-                            ext = (
+                            ext = (  # SILAS_EXT_MSC2530_CACHE_EXT
                                 Path(
-                                    body
+                                    transport_filename
                                     or (
                                         "voice.ogg" if is_voice_message else "audio.ogg"
                                     )
@@ -3669,7 +3706,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
                             cached_path = cache_audio_from_bytes(file_bytes, ext=ext)
                         else:
-                            filename = body or (
+                            filename = transport_filename or (  # SILAS_EXT_MSC2530_CACHE_NAME
                                 "video.mp4"
                                 if msg_type == MessageType.VIDEO
                                 else "document"
@@ -3710,7 +3747,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     room_id, reply_to_author_id
                 )
 
-        if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
+        # MSC2530 (SILAS_EXT_MSC2530_CAPTIONS): a top-level "filename" field marks the
+        # transport name; the body is a user-typed caption only when it differs. This is
+        # authoritative — even a caption that *looks* like a filename (e.g. "screenshot.png")
+        # is kept when the sender declared a different real filename. The old suffix
+        # heuristic remains only for legacy clients that never send "filename".
+        declared_filename = str(source_content.get("filename") or "").strip()
+        if declared_filename:
+            if body.strip() == declared_filename:
+                body = ""
+        elif msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
 
         allow_http_fallback = bool(http_url) and not is_encrypted_media
@@ -3898,6 +3944,51 @@ class MatrixAdapter(BasePlatformAdapter):
         """Remove a reaction by redacting its event."""
         return await self.redact_message(room_id, reaction_event_id, reason)
 
+    # SILAS_EXT_MATRIX_AGENT_REACTIONS_METHODS (silas_ext/reapply.py): the public
+    # verbs send_message(action="react"/"unreact") looks up via getattr. Deliberate
+    # agent intents, so NOT gated by MATRIX_REACTIONS — that env exists to mute the
+    # automatic lifecycle tapbacks (👀/✅), per the photon adapter's precedent.
+
+    async def add_reaction(self, chat_id, emoji, message_id=None):
+        """React ``emoji`` onto a message; defaults to the message being answered."""
+        target = message_id or self.__dict__.get(
+            "_agent_reaction_last_target", {}
+        ).get(str(chat_id))
+        if not target:
+            return {
+                "success": False,
+                "error": "no message to react to — pass message_id (no inbound "
+                "message processed in this room since the gateway started)",
+            }
+        reaction_event_id = await self._send_reaction(str(chat_id), str(target), emoji)
+        if not reaction_event_id:
+            return {
+                "success": False,
+                "error": "reaction send failed (see gateway debug log)",
+            }
+        self.__dict__.setdefault("_agent_own_reactions", {})[
+            (str(chat_id), str(target))
+        ] = reaction_event_id
+        return {"success": True, "message_id": str(target)}
+
+    async def remove_reaction(self, chat_id, message_id=None):
+        """Retract our reaction from a message (best-effort)."""
+        target = message_id or self.__dict__.get(
+            "_agent_reaction_last_target", {}
+        ).get(str(chat_id))
+        if not target:
+            return {"success": False, "error": "no message to unreact — pass message_id"}
+        own = self.__dict__.get("_agent_own_reactions", {}).pop(
+            (str(chat_id), str(target)), None
+        )
+        if not own:
+            return {
+                "success": False,
+                "error": "no reaction of ours recorded on that message this session",
+            }
+        ok = await self._redact_reaction(str(chat_id), own, "agent unreact")
+        return {"success": bool(ok), "message_id": str(target)}
+
     def _schedule_reaction_redaction(
         self,
         room_id: str,
@@ -3929,6 +4020,14 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add eyes reaction when the agent starts processing a message."""
+        # SILAS_EXT_MATRIX_AGENT_REACTIONS (silas_ext/reapply.py): remember the
+        # triggering message per room so add_reaction() below can default to "the
+        # message I'm answering" (photon's _last_inbound_by_chat precedent). Recorded
+        # before the lifecycle gate — muting the eyes must not blind agent reactions.
+        if event.message_id and event.source.chat_id:
+            self.__dict__.setdefault("_agent_reaction_last_target", {})[
+                str(event.source.chat_id)
+            ] = str(event.message_id)
         if not self._reactions_enabled:
             return
         msg_id = event.message_id

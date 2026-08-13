@@ -3441,6 +3441,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         )
                 break
 
+            # keryx_stream: a pending /steer during a text-only completion ends the
+            # stream here — the partial answer commits and the steer becomes the
+            # immediate next turn instead of waiting out the full answer. The size
+            # floor keeps a just-started answer streaming (a first-token break
+            # committed bare fragments like "The" as real messages); short answers
+            # finish on their own and the steer lands via the leftover path.
+            if (
+                getattr(agent, "_pending_steer", None)
+                and not tool_calls_acc
+                and sum(len(_p) for _p in content_parts) >= 120
+            ):
+                finish_reason = "stop"
+                break
+
             if not _stream_attempt_is_active(stream_attempt_id):
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue

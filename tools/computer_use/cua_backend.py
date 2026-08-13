@@ -2274,6 +2274,31 @@ class CuaDriverBackend(ComputerUseBackend):
         # `app="Calculator"` legitimately matches no windows on a non-English
         # system and the caller needs to retry with the localized name.
         if pid is None and window_id is None and app and app.strip().lower() in _SCREEN_CAPTURE_SENTINELS:
+            # SILAS_EXT_DESKTOP_CAPTURE: cua-driver >=0.8 exposes get_desktop_state,
+            # a TRUE full-display grab that works for a fullscreen game + the whole
+            # composited desktop — the shell-window fallback below returns 0x0 for a
+            # fullscreen app (e.g. Rust). Prefer get_desktop_state when present.
+            if (self._session._has_tool("get_desktop_state")
+                    or not self._session.capabilities_discovered):
+                try:
+                    _ds = self._session.call_tool(
+                        "get_desktop_state", {"session": self._session_id})
+                    _ds_png, _ds_mime = _image_from_tool_result(_ds)
+                    if _ds_png:
+                        _sc = (_ds.get("structuredContent")
+                               if isinstance(_ds, dict) else None) or {}
+                        _dw = int(_sc.get("screen_width")
+                                  or _sc.get("screenshot_width") or 0)
+                        _dh = int(_sc.get("screen_height")
+                                  or _sc.get("screenshot_height") or 0)
+                        return CaptureResult(
+                            mode=mode, width=_dw, height=_dh, png_b64=_ds_png,
+                            elements=[], app="desktop", window_title="",
+                            png_bytes_len=len(_ds_png), image_mime_type=_ds_mime)
+                except Exception as _ds_exc:
+                    logger.warning(
+                        "get_desktop_state capture failed (%s); falling back "
+                        "to shell-window capture", _ds_exc)
             # Whole-screen / desktop request. cua-driver has no virtual-desktop
             # capture tool, so resolve to the OS shell/desktop window (the
             # desktop backdrop or the taskbar/menu-bar), which list_windows
