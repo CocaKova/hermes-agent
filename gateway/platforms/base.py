@@ -5107,8 +5107,21 @@ class BasePlatformAdapter(ABC):
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        # SILAS_TYPING_OWNER_GUARD (silas_ext/reapply.py): one live refresh loop
+        # per chat. A leaked _keep_typing task once hammered set_typing every 2s
+        # for hours after its turn ended, pinning clients' "working" indicators.
+        # Ownership is claimed here and checked every tick; a superseded or
+        # stopped loop exits instead of refreshing a turn that no longer exists.
+        _typing_owners = getattr(self, "_silas_typing_owners", None)
+        if _typing_owners is None:
+            _typing_owners = {}
+            self._silas_typing_owners = _typing_owners
+        _typing_me = asyncio.current_task()
+        _typing_owners[str(chat_id)] = _typing_me
         try:
             while True:
+                if _typing_owners.get(str(chat_id)) is not _typing_me:
+                    return
                 if stop_event is not None and stop_event.is_set():
                     return
                 if chat_id not in self._typing_paused:
@@ -5147,11 +5160,17 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            # SILAS_TYPING_OWNER_RELEASE: only the current owner may clear the
+            # platform typing state — a superseded loop clearing it would stomp
+            # the newer turn's live indicator.
+            _typing_still_owner = _typing_owners.get(str(chat_id)) is _typing_me
+            if _typing_still_owner:
+                _typing_owners.pop(str(chat_id), None)
             # Ensure the underlying platform typing loop is stopped.
             # _keep_typing may have called send_typing() after an outer
             # stop_typing() cleared the task dict, recreating the loop.
             # Cancelling _keep_typing alone won't clean that up.
-            if hasattr(self, "stop_typing"):
+            if _typing_still_owner and hasattr(self, "stop_typing"):
                 try:
                     await self._stop_typing_with_metadata(chat_id, metadata)
                 except Exception:
@@ -5172,6 +5191,17 @@ class BasePlatformAdapter(ABC):
         stop_attempts: int = 2,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        # SILAS_TYPING_OWNER_STOP: stopping revokes the stopped task's claim so
+        # a refresh loop that somehow survives cancellation self-terminates on
+        # its next tick instead of typing forever. A claim held by a DIFFERENT
+        # live task (a newer turn already running) is left alone.
+        _typing_owners = getattr(self, "_silas_typing_owners", None)
+        if _typing_owners is not None:
+            _typing_cur = _typing_owners.get(str(chat_id))
+            if _typing_cur is not None and (
+                typing_task is None or _typing_cur is typing_task or _typing_cur.done()
+            ):
+                _typing_owners.pop(str(chat_id), None)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():

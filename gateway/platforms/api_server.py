@@ -7362,6 +7362,11 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            try:
+                from gateway.keryx_stream import register_keryx_routes
+                register_keryx_routes(self._app.router, self._check_auth)
+            except Exception:
+                logger.debug("keryx routes unavailable", exc_info=True)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

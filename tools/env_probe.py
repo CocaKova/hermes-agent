@@ -29,12 +29,15 @@ Toggle via ``agent.environment_probe`` in config.yaml (default True).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
+import urllib.request
 from typing import Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -186,8 +189,88 @@ def _pip_python_version() -> Optional[str]:
     return None
 
 
-def _build_probe_line() -> str:
-    """Build the one-liner.  Returns "" when nothing notable is detected.
+def _list_global_ipv4() -> list[tuple[str, str]]:
+    """Return (iface, ip) pairs for every interface with a global-scope IPv4 addr."""
+    rc, out, _err = _run(["ip", "-4", "-o", "addr", "show", "scope", "global"])
+    if rc != 0:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        ip = parts[3].split("/")[0]
+        pairs.append((iface, ip))
+    return pairs
+
+
+def _first_with_prefix(
+    pairs: list[tuple[str, str]], prefixes: tuple[str, ...], *, exclude: bool = False
+) -> Optional[str]:
+    """First IP whose interface name starts with one of ``prefixes``.
+
+    With ``exclude=True``, returns the first IP whose interface name does
+    NOT start with any of ``prefixes`` instead (used to find "the LAN
+    interface" by ruling out loopback/docker/tailscale/etc.).
+    """
+    for iface, ip in pairs:
+        matches = iface.startswith(prefixes)
+        if matches != exclude:
+            return ip
+    return None
+
+
+# Interface-name prefixes that are never "the LAN" — virtual/container
+# bridges and the Tailscale interface (reported separately).
+_VIRTUAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth", "virbr", "tailscale")
+
+
+def _brain_label() -> Optional[str]:
+    """Return the model id currently served on the local vLLM brain (:8000), or None.
+
+    Best-effort and fast (short timeout) — the brain is a hot-swappable
+    local service, so this must be a live read, never a cached/RAG fact.
+    """
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8000/v1/models")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data") or []
+        if not models:
+            return None
+        return models[0].get("id")
+    except Exception:
+        return None
+
+
+def _build_network_line() -> str:
+    """Always-on host/network line: hostname, Tailscale IP, LAN IP, live brain.
+
+    Unlike the Python-toolchain line below, this is never suppressed —
+    ambient facts like "what's my IP" or "what brain am I" need to be in
+    every system prompt, not something the model has to RAG-recall
+    (relevance search over the current message misses them constantly).
+    """
+    bits = [f"host {socket.gethostname()}"]
+
+    pairs = _list_global_ipv4()
+    ts_ip = _first_with_prefix(pairs, ("tailscale",))
+    if ts_ip:
+        bits.append(f"Tailscale {ts_ip}")
+    lan_ip = _first_with_prefix(pairs, _VIRTUAL_IFACE_PREFIXES, exclude=True)
+    if lan_ip:
+        bits.append(f"LAN {lan_ip}")
+
+    brain = _brain_label()
+    if brain:
+        bits.append(f"brain(:8000)={brain}")
+
+    return "Host & network: " + "; ".join(bits) + "."
+
+
+def _build_python_line() -> str:
+    """Build the Python-toolchain one-liner.  Returns "" when nothing notable is detected.
 
     Emit only when SOMETHING is off — the goal is to save the model from
     hitting an avoidable wall, not to narrate a healthy environment.
@@ -268,12 +351,20 @@ def _build_probe_line() -> str:
     return "Python toolchain: " + ", ".join(bits) + "."
 
 
+def _build_probe_line() -> str:
+    """Combine the always-on network line with the conditional Python line."""
+    network_line = _build_network_line()
+    python_line = _build_python_line()
+    if python_line:
+        return network_line + " " + python_line
+    return network_line
+
+
 def get_environment_probe_line(*, force_refresh: bool = False) -> str:
     """Return the cached probe line (building it on first call).
 
-    Returns "" when the environment is clean — the system prompt
-    assembler should drop the section in that case rather than
-    emit an empty heading.
+    The network line (host/Tailscale/LAN/brain) is always-on and never
+    empty; only the Python-toolchain portion can be suppressed.
 
     The probe itself always runs in a single background worker thread;
     this function waits on its completion event for at most

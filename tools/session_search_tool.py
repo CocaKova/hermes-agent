@@ -167,7 +167,13 @@ def _is_compression_ended(db, session_id: str) -> bool:
         s = db.get_session(session_id)
         if not s:
             return False
-        return s.get("end_reason") == "compression"
+        # SILAS_SS_RESET_DISCOVERABLE (silas_ext/reapply.py): a session that
+        # ended via compression OR session_reset no longer contributes content
+        # to the live context (compression rolls forward only a summary; a
+        # reset rolls forward nothing), so its messages must stay discoverable
+        # even inside the current lineage. Delegation children keep
+        # end_reason=None and stay excluded.
+        return s.get("end_reason") in ("compression", "session_reset")
     except Exception:
         return False
 
@@ -1042,11 +1048,21 @@ SESSION_SEARCH_SCHEMA = {
         "to pick it up?\"), never alone on its own line, and never alongside the "
         "title, id, or date spelled out — that shows the user the same session "
         "twice.\n\n"
-        "FTS5 SYNTAX\n\n"
-        "  AND is the default — multi-word queries require all terms. Use OR explicitly "
-        "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
-        "(`\"docker networking\"`), boolean (`python NOT java`), or prefix wildcards "
-        "(`deploy*`).\n\n"
+        # SILAS_SS_QUERY_DISCIPLINE (silas_ext/reapply.py)
+        "QUERY DISCIPLINE — read before every discovery call\n\n"
+        "  - Query with 1-3 DISTINCTIVE nouns (project names, filenames, hostnames, "
+        "error strings). Every term is ANDed — one message must contain ALL of them — "
+        "so generic-verb soups (fixed, created, script, issue) match noise or "
+        "nothing.\n"
+        "  - Operators are UPPERCASE ONLY. Lowercase `or`/`and`/`not` are searched as "
+        "literal words and silently break the query. Alternatives: `alpha OR beta`. "
+        "Exact phrase: `\"docker networking\"`. Exclusion: `python NOT java`. Prefix: "
+        "`deploy*`.\n"
+        "  - OMIT `sort` unless the question is explicitly about the latest or "
+        "earliest occurrence — passing it discards the relevance ranking that "
+        "surfaces the right session.\n"
+        "  - Zero or junk results: re-check spelling, then retry with FEWER, more "
+        "distinctive terms. Never add words to a failing query.\n\n"
         "WHEN TO USE\n\n"
         "  Reach for this on questions about Hermes conversation history itself, such "
         "as \"what did we do about X\", \"where did we leave Y\", or \"find the "
@@ -1080,12 +1096,14 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["newest", "oldest"],
                 "description": (
-                    "Discovery shape only. Temporal bias on top of FTS5 ranking. Omit "
-                    "to keep relevance-only ordering (suitable for exploratory recall — "
-                    "\"what do we know about X\"). Set 'newest' for recency-shaped "
-                    "questions (\"where did we leave X\"). Set 'oldest' for "
-                    "origin-shaped questions (\"how did X start\"). Ignored in scroll "
-                    "and browse shapes."
+                    # SILAS_SS_SORT_WARNING (silas_ext/reapply.py)
+                    "Discovery shape only. WARNING: this REPLACES relevance ranking "
+                    "with pure timestamp order (match quality only breaks ties), so "
+                    "recent noise outranks the best match. Omit for nearly all "
+                    "searches. Set 'newest' only when the question is about the "
+                    "LATEST occurrence (\"where did we leave X\"), 'oldest' only for "
+                    "origins (\"how did X start\"). Ignored in scroll and browse "
+                    "shapes."
                 ),
             },
             "session_id": {
