@@ -2567,6 +2567,11 @@ def init_agent(
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
     _merge_custom_provider_extra_body(agent, _custom_providers)
+    try:
+        from gateway import keryx_stream as _keryx
+        _keryx.apply_thinking_kwargs(agent)
+    except Exception:
+        pass
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:

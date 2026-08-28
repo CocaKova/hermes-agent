@@ -17,7 +17,9 @@ command into a Matrix room. While that subscriber is attached:
     until the final Matrix event syncs in;
   * ``event: tool`` carries the tool + subagent lifecycle (start / end / subagent.*) as JSON, so
     the app can show what the agent is DOING mid-turn instead of a spinner (see
-    ``_attach_tool_callbacks``).
+    ``_attach_tool_callbacks``); every ``end`` carries the (middle-clipped) result;
+  * ``event: status`` mirrors the agent's lifecycle status lines — above all context
+    compaction, which the chat gateway swallows by design (see ``_attach_status_mirror``).
 
 When no subscriber is attached and ``FALLBACK_EDITS`` is True, Matrix falls back to
 smart-throttled native m.replace edits driven by the normal streaming config
@@ -245,15 +247,36 @@ def publish_stop(adapter: Any, chat_id: Any, final_text: Optional[str] = None) -
 # the client can prefer the newest open entry with a matching name.
 
 _TOOL_PREVIEW_MAX = 240
-# Failures only (see below), and clipped: the full result lands in the committed Matrix message
-# a moment later, and an unbounded one would push megabytes through a phone's SSE socket.
-_TOOL_RESULT_MAX = 400
+# Every completion carries its result (2.5.7 — it used to ride only on a failure). The
+# committed Matrix message never carries tool output at all: a success's payload was "the
+# answer's raw material", which is true for the model and false for the reader — what a tool
+# actually handed back (a terminal's stdout, the syntax oracle's verdict appended to a
+# write_file result) had no window anywhere on the phone. Clipped, and from the MIDDLE: a
+# result's head says what it is and its tail is where a `transform_tool_result` plugin
+# appends its verdict, so cutting the tail off would cut off exactly the part a diagnosis
+# lives in.
+_TOOL_RESULT_MAX = 2400
+_TOOL_RESULT_TAIL = 800
 
 
 def _clip(value: Any, limit: int) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\r\n", "\n").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _clip_middle(value: Any, limit: int = _TOOL_RESULT_MAX, tail: int = _TOOL_RESULT_TAIL) -> str:
+    """Clip to ``limit`` keeping both ends — the head names the payload, the tail carries any
+    appended verdict. The elision line states how much is missing so a clipped body never
+    reads as the whole."""
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").strip()
+    if len(text) <= limit:
+        return text
+    tail = max(0, min(tail, limit // 2))
+    head = limit - tail
+    elided = len(text) - head - tail
+    return f"{text[:head].rstrip()}\n⋯ {elided:,} chars elided ⋯\n{text[len(text) - tail:].lstrip()}"
 
 
 # Every ``subagent.*`` event carries the same identity block (goal, task index/count, model,
@@ -416,13 +439,14 @@ def _attach_tool_callbacks(agent: Any, platform: str, chat_id: str) -> None:
                 ok = not bool(kw.get("is_error"))
                 frame = {"phase": "end", "name": str(name or "tool"), "ok": ok,
                          "ms": int(float(kw.get("duration") or 0.0) * 1000)}
-                # Only a FAILURE carries its result. A success's output is the answer's raw
-                # material — it lands in the committed message a moment later, rendered
-                # properly, and pushing a few hundred bytes of escaped JSON per call to a phone
-                # to show nothing is waste. A failure is the one case where the mid-turn glimpse
-                # is the whole point.
-                if not ok:
-                    frame["result"] = _clip(kw.get("result"), _TOOL_RESULT_MAX)
+                # The result rides on every completion (see _TOOL_RESULT_MAX). ``result`` here
+                # is the display result AFTER ``transform_tool_result`` hooks ran — a plugin's
+                # appended verdict is part of it — because the executor fires this callback
+                # from the same post-hook value it appends to the conversation.
+                result = _clip_middle(kw.get("result"))
+                if result:
+                    frame["result"] = result
+                    frame["result_len"] = len(str(kw.get("result") or ""))
                 _emit(frame)
             elif et.startswith("subagent."):
                 frame = _subagent_frame(et, name, preview, kw)
@@ -478,6 +502,128 @@ def _attach_tool_callbacks(agent: Any, platform: str, chat_id: str) -> None:
     agent.tool_complete_callback = _on_complete
 
 
+# --- lifecycle status: compaction (Keryx 2.5.7) -------------------------------------------
+#
+# A Matrix turn that hits the context threshold goes quiet for as long as the summary model
+# takes — the agent core says so (``_emit_status`` → ``status_callback("lifecycle", …)``), but
+# ``gateway/run.py`` swallows every routine compression line on chat platforms by design
+# (``_TELEGRAM_NOISY_STATUS_RE``; opt-in ``compression.progress_notices`` posts them as room
+# messages, which is the wrong shape — a status is a state, not a bubble). So the side-channel
+# mirrors it as ``event: status``:
+#
+#   {"kind": "compacting", "text": "📦 Pre-API compression: ~123,456 tokens …", "tokens": 123456}
+#   {"kind": "lifecycle",  "text": "…any other lifecycle line…"}
+#   {"kind": "warning",    "text": "⚠ …"}
+#   {"kind": "ready"}                       # _compress_context returned — the wait is over
+#
+# ⚠️ run.py assigns ``agent.status_callback`` AFTER it calls attach_reasoning_callback, so a
+# chained status_callback would be overwritten every turn. The mirror wraps the two *emitters*
+# on the instance (``_emit_status`` / ``_emit_warning``) instead — an instance attribute shadows
+# the class method and survives whatever run.py does to the callback. Tagged and unwrapped on
+# re-attach, same as the tool mirror, because the agent is cached across turns.
+
+_COMPACTION_GLYPHS = ("📦", "🗜", "💤")
+
+
+def _compression_progress_re() -> Optional["re.Pattern[str]"]:
+    """The gateway's own template-derived matcher, so the classification is the one the agent
+    emits rather than a hand-copied phrase; None when the import shape moves."""
+    try:
+        from gateway.run import _COMPRESSION_PROGRESS_STATUS_RE
+
+        return _COMPRESSION_PROGRESS_STATUS_RE
+    except Exception:
+        return None
+
+
+def classify_status(message: Any) -> str:
+    """'compacting' for a routine compression status line, else 'lifecycle'."""
+    text = str(message or "")
+    try:
+        from agent.conversation_compression import COMPACTION_STATUS_MARKER
+
+        if COMPACTION_STATUS_MARKER in text:
+            return "compacting"
+    except Exception:
+        pass
+    pat = _compression_progress_re()
+    if pat is not None and pat.search(text):
+        return "compacting"
+    # Fallback for a gateway whose regex moved: every routine template opens with one of these.
+    if text.lstrip().startswith(_COMPACTION_GLYPHS):
+        return "compacting"
+    return "lifecycle"
+
+
+_TOKENS_RE = re.compile(r"~\s*([\d,]+)\s*tokens")
+
+
+def status_frame(kind: str, message: Any = "") -> Dict[str, Any]:
+    frame: Dict[str, Any] = {"kind": kind}
+    text = _clip(message, 400)
+    if text:
+        frame["text"] = text
+        m = _TOKENS_RE.search(text)
+        if m:
+            try:
+                frame["tokens"] = int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    return frame
+
+
+def _attach_status_mirror(agent: Any, platform: str, chat_id: str) -> None:
+    def _emit(frame: Dict[str, Any]) -> None:
+        try:
+            hub.publish_threadsafe(platform, chat_id, "status", json.dumps(frame))
+        except Exception:
+            pass
+
+    prev_status = getattr(agent, "_emit_status", None)
+    prev_status = getattr(prev_status, "_keryx_inner", prev_status)
+
+    def _status(message: str) -> None:
+        try:
+            _emit(status_frame(classify_status(message), message))
+        except Exception:
+            logger.debug("keryx status mirror failed", exc_info=True)
+        if prev_status is not None:
+            prev_status(message)
+
+    _status._keryx_inner = prev_status  # type: ignore[attr-defined]
+    agent._emit_status = _status
+
+    prev_warning = getattr(agent, "_emit_warning", None)
+    prev_warning = getattr(prev_warning, "_keryx_inner", prev_warning)
+
+    def _warning(message: str) -> None:
+        try:
+            _emit(status_frame("warning", message))
+        except Exception:
+            logger.debug("keryx warning mirror failed", exc_info=True)
+        if prev_warning is not None:
+            prev_warning(message)
+
+    _warning._keryx_inner = prev_warning  # type: ignore[attr-defined]
+    agent._emit_warning = _warning
+
+    # The end of the wait. Every compression path (pre-API, preflight, retry, idle) goes
+    # through ``agent._compress_context``; nothing announces its return, and the next thing
+    # the app would otherwise hear is the first token of the NEXT model call — which can be a
+    # long prefill away. So: ``ready`` the moment it returns, success or raise.
+    prev_compress = getattr(agent, "_compress_context", None)
+    prev_compress = getattr(prev_compress, "_keryx_inner", prev_compress)
+    if prev_compress is not None:
+        def _compress(*args: Any, **kw: Any) -> Any:
+            try:
+                return prev_compress(*args, **kw)
+            finally:
+                _emit(status_frame("ready"))
+
+        _compress._keryx_inner = prev_compress  # type: ignore[attr-defined]
+        agent._compress_context = _compress
+
+
 def attach_reasoning_callback(agent: Any, source: Any) -> None:
     """Register this turn's live mirrors on the agent — reasoning, and via
     [_attach_tool_callbacks] the tool/subagent theater.
@@ -506,6 +652,7 @@ def attach_reasoning_callback(agent: Any, source: Any) -> None:
 
         agent.reasoning_callback = _mirror_reasoning
         _attach_tool_callbacks(agent, platform, chat_id)
+        _attach_status_mirror(agent, platform, chat_id)
         # Same per-turn refresh cadence as the callback itself: the finish-line usage frame
         # (see _publish_usage) reads this turn's agent, weakly held.
         import weakref
@@ -685,6 +832,9 @@ def _reasoning_capabilities() -> Dict[str, Any]:
         "reasoning": reasoning,
         "show_reasoning": show,
         "room_profiles": room_profiles,
+        # The Shipyard door (git review) — the app gates the drawer entry on this,
+        # never on a 403 probe.
+        "git": _shipyard_enabled(),
     }
 
 
@@ -3168,6 +3318,219 @@ def update_start() -> Tuple[int, dict]:
     return 202, {"ok": True, "started": entry["label"]}
 
 
+# ---------------------------------------------------------------------------
+# The Shipyard — git review over the direct door (roadmap §2 "The Forge";
+# renamed: the app already has a Skill Forge).
+#
+# A thin, confined layer over hermes_cli.web_git (the library the dashboard's
+# /api/git/* routes wrap).  Three rules that the dashboard does not enforce:
+#   * OFF unless `keryx.git.enabled: true` in config.yaml — a phone that can
+#     commit and push is a phone that acts as the gateway's user.
+#   * `path` must resolve INSIDE the gateway user's home and be a git work
+#     tree (or inside one).  No other confinement exists in web_git.
+#   * Diffs are clipped server-side with an honest `clipped` flag — a phone
+#     socket does not want a 3000-line generated file, and silent truncation
+#     is worse than a short diff.
+# Revert and create-pr are deliberately NOT exposed in this landing: revert
+# destroys work no git object holds; create-pr opens a PR as the user.
+# ---------------------------------------------------------------------------
+
+_SHIPYARD_DIFF_MAX_LINES = 2500
+_SHIPYARD_DIFF_MAX_CHARS = 200_000
+
+
+def _shipyard_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+
+        git_cfg = (load_config().get("keryx") or {}).get("git") or {}
+        return bool(git_cfg.get("enabled", False))
+    except Exception:
+        return False
+
+
+def _shipyard_gate() -> Optional[Tuple[int, Dict[str, Any]]]:
+    """(status, payload) to return when the Forge is switched off (keryx.git.enabled), else None."""
+    if _shipyard_enabled():
+        return None
+    return 403, {"error": {"message": "keryx.git is disabled on this gateway", "code": "shipyard_off"}}
+
+
+def _shipyard_repo(raw: Any) -> Path:
+    """Harden a client path: inside $HOME, exists, is (inside) a git work tree.
+    Raises ValueError (→ 400) otherwise."""
+    text = str(raw or "").strip()
+    if not text or "\0" in text:
+        raise ValueError("path is required")
+    home = Path.home().resolve()
+    try:
+        p = Path(os.path.expanduser(text)).resolve(strict=True)
+    except Exception:
+        raise ValueError("path does not exist")
+    if p != home and home not in p.parents:
+        raise ValueError("path is outside the gateway user's home")
+    if not p.is_dir():
+        raise ValueError("path is not a directory")
+    code, top = _git(p, "rev-parse", "--show-toplevel", timeout=10)
+    if code != 0 or not top:
+        raise ValueError("path is not inside a git work tree")
+    return p
+
+
+def _shipyard_clip(diff: str) -> Dict[str, Any]:
+    """Clip a unified diff by line and by byte, flagging what was cut."""
+    text = diff or ""
+    lines = text.splitlines()
+    clipped = False
+    omitted_lines = 0
+    if len(lines) > _SHIPYARD_DIFF_MAX_LINES:
+        omitted_lines = len(lines) - _SHIPYARD_DIFF_MAX_LINES
+        lines = lines[:_SHIPYARD_DIFF_MAX_LINES]
+        clipped = True
+    out = "\n".join(lines)
+    if len(out) > _SHIPYARD_DIFF_MAX_CHARS:
+        out = out[:_SHIPYARD_DIFF_MAX_CHARS]
+        cut = out.rfind("\n")
+        if cut > 0:
+            out = out[:cut]
+        omitted_lines = max(omitted_lines, len(text.splitlines()) - out.count("\n") - 1)
+        clipped = True
+    return {"diff": out, "clipped": clipped, "omittedLines": omitted_lines if clipped else 0,
+            "totalLines": len(text.splitlines())}
+
+
+def shipyard_repos() -> Dict[str, Any]:
+    """The repo roster a phone can pick from: every folder of every explicit
+    project plus the discovered repos — only those that are git work trees."""
+    seen: Dict[str, Dict[str, Any]] = {}
+
+    def _add(path: str, label: str, source: str) -> None:
+        try:
+            p = _shipyard_repo(path)
+        except ValueError:
+            return
+        key = str(p)
+        if key in seen:
+            return
+        code, branch = _git(p, "rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+        seen[key] = {"path": key, "label": label or p.name, "source": source,
+                     "branch": branch if code == 0 and branch != "HEAD" else None}
+
+    try:
+        from hermes_cli import projects_db
+
+        with projects_db.connect_closing() as conn:
+            for proj in projects_db.list_projects(conn):
+                for f in getattr(proj, "folders", []) or []:
+                    _add(f.path, proj.name if len(proj.folders) == 1 else f"{proj.name} · {Path(f.path).name}", "project")
+            for repo in projects_db.list_discovered_repos(conn):
+                path = repo.get("path") if isinstance(repo, dict) else None
+                if path:
+                    _add(path, Path(path).name, "discovered")
+    except Exception:
+        logger.debug("shipyard: projects roster unavailable", exc_info=True)
+    return {"repos": list(seen.values())}
+
+
+def _shipyard_routes(router: Any, check_auth) -> None:
+    from hermes_cli import web_git
+
+    def gated(work):
+        def _w(request, body):
+            off = _shipyard_gate()
+            if off is not None:
+                return off
+            try:
+                return work(request, body)
+            except RuntimeError as exc:  # web_git mutations raise these
+                return 409, {"error": {"message": str(exc) or "git operation failed", "code": "git"}}
+        return _w
+
+    def q(request, body, key, default=""):
+        v = body.get(key) if body else None
+        if v is None:
+            v = request.query.get(key, default)
+        return v
+
+    def _repos(request, body):
+        return 200, shipyard_repos()
+
+    def _status(request, body):
+        repo = _shipyard_repo(q(request, body, "path"))
+        st = web_git.repo_status(str(repo))
+        return 200, {"path": str(repo), "status": st}
+
+    def _list(request, body):
+        repo = _shipyard_repo(q(request, body, "path"))
+        scope = str(q(request, body, "scope", "uncommitted") or "uncommitted")
+        base = q(request, body, "base", None) or None
+        out = web_git.review_list(str(repo), scope, base)
+        out["path"] = str(repo)
+        out["scope"] = scope
+        return 200, out
+
+    def _diff(request, body):
+        repo = _shipyard_repo(q(request, body, "path"))
+        file_path = str(q(request, body, "file") or "").strip()
+        if not file_path:
+            raise ValueError("file is required")
+        scope = str(q(request, body, "scope", "uncommitted") or "uncommitted")
+        base = q(request, body, "base", None) or None
+        staged = str(q(request, body, "staged", "")).lower() in ("1", "true")
+        raw = web_git.review_diff(str(repo), file_path, scope, base, staged)
+        out = _shipyard_clip(raw)
+        out.update({"file": file_path, "scope": scope, "staged": staged})
+        return 200, out
+
+    def _stage(request, body):
+        repo = _shipyard_repo(body.get("path"))
+        return 200, web_git.review_stage(str(repo), body.get("file") or None)
+
+    def _unstage(request, body):
+        repo = _shipyard_repo(body.get("path"))
+        return 200, web_git.review_unstage(str(repo), body.get("file") or None)
+
+    def _commit_context(request, body):
+        repo = _shipyard_repo(q(request, body, "path"))
+        return 200, web_git.review_commit_context(str(repo))
+
+    def _commit(request, body):
+        repo = _shipyard_repo(body.get("path"))
+        message = str(body.get("message") or "").strip()
+        if not message:
+            raise ValueError("message is required")
+        push = bool(body.get("push", False))
+        out = web_git.review_commit(str(repo), message, push)
+        code, sha = _git(repo, "rev-parse", "--short", "HEAD", timeout=10)
+        out["sha"] = sha if code == 0 else None
+        out["pushed"] = push
+        return 200, out
+
+    def _push(request, body):
+        repo = _shipyard_repo(body.get("path"))
+        code, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+        if code != 0 or branch == "HEAD":
+            raise ValueError("HEAD is detached — nothing to push")
+        out = web_git.review_push(str(repo))
+        out["branch"] = branch
+        return 200, out
+
+    def _ship_info(request, body):
+        repo = _shipyard_repo(q(request, body, "path"))
+        return 200, web_git.review_ship_info(str(repo))
+
+    router.add_get("/keryx/git/repos", _make_json_handler(check_auth, gated(_repos)))
+    router.add_get("/keryx/git/status", _make_json_handler(check_auth, gated(_status)))
+    router.add_get("/keryx/git/review/list", _make_json_handler(check_auth, gated(_list)))
+    router.add_get("/keryx/git/review/diff", _make_json_handler(check_auth, gated(_diff)))
+    router.add_get("/keryx/git/review/commit-context", _make_json_handler(check_auth, gated(_commit_context)))
+    router.add_get("/keryx/git/review/ship-info", _make_json_handler(check_auth, gated(_ship_info)))
+    router.add_post("/keryx/git/review/stage", _make_json_handler(check_auth, gated(_stage)))
+    router.add_post("/keryx/git/review/unstage", _make_json_handler(check_auth, gated(_unstage)))
+    router.add_post("/keryx/git/review/commit", _make_json_handler(check_auth, gated(_commit)))
+    router.add_post("/keryx/git/review/push", _make_json_handler(check_auth, gated(_push)))
+
+
 def register_keryx_routes(router: Any, check_auth) -> None:
     """Single registrar for every /keryx/* route — api_server.py calls only
     this, so future routes ship in this module (copied wholesale by
@@ -3383,3 +3746,4 @@ def register_keryx_routes(router: Any, check_auth) -> None:
     router.add_post("/keryx/update/check", _make_json_handler(check_auth, _update_check_post))
     router.add_post("/keryx/update/probe", _make_json_handler(check_auth, _update_probe_post))
     router.add_post("/keryx/update", _make_json_handler(check_auth, _update_post))
+    _shipyard_routes(router, check_auth)
