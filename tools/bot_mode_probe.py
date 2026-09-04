@@ -156,11 +156,52 @@ def _profile_role(profile_dir: Path) -> str:
         return ""
 
 
+def _is_bot_hidden(profile_dir: Path) -> bool:
+    """True when the Bots door marked this bot hidden.
+
+    The roster card writes ``ui_meta['hermes-bots'].hidden`` when the user
+    hides a bot, but nothing here ever read it — so a bot hidden in the UI
+    stayed advertised as a teammate in every other bot's prompt, and the only
+    way to drop one was to delete its profile. Never raises.
+    """
+    meta = profile_dir / "profile.yaml"
+    try:
+        if not meta.is_file():
+            return False
+        raw = meta.read_text(encoding="utf-8", errors="replace")
+        if "hermes-bots" not in raw:
+            return False
+        import yaml
+
+        data = yaml.safe_load(raw)
+        ui_meta = data.get("ui_meta") if isinstance(data, dict) else None
+        if not isinstance(ui_meta, dict):
+            return False
+        block = ui_meta.get("hermes-bots")
+        return isinstance(block, dict) and bool(block.get("hidden"))
+    except Exception:
+        return False
+
+
 def _roster_lines(root: Path, me: str) -> list[str]:
-    """One '- `@handle` — role' line per teammate (excluding ``me``)."""
+    """One '- `@handle` — role' line per teammate (excluding ``me``).
+
+    A ``profiles/`` entry is a teammate only when it is armed for Bot Mode
+    and not hidden. ``ui_meta['hermes-bots']`` is the arm switch the Bots
+    door writes, so it also decides roster membership: a directory that was
+    never armed — or is not a profile at all, since staging and backup dirs
+    live there too — is not a teammate, and advertising one hands the agent a
+    handle whose DM cannot land. ``~/.hermes`` itself is the install's main
+    agent rather than a managed profile, so it stays reachable as @hermes
+    either way; hiding the hub would strand every other bot.
+    """
     lines = []
     for name, profile_dir in _roster(root):
         if name == me:
+            continue
+        if profile_dir != root and (
+            not _is_bot_managed(profile_dir) or _is_bot_hidden(profile_dir)
+        ):
             continue
         role = _profile_role(profile_dir)
         handle = _handle(name)

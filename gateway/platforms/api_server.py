@@ -4581,6 +4581,12 @@ class APIServerAdapter(BasePlatformAdapter):
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
+            # SILAS_FORK_BRANCH_MARKER (silas_ext/reapply.py): the stable marker
+            # keeps the fork listable. end_session(source,'branched') above no-ops
+            # on an already-ended source, so the legacy heuristic never holds for
+            # forks of completed sessions and they were hidden as ephemeral
+            # children. Same marker the gateway's /branch writes at create time.
+            model_config={"_branched_from": source_id},
         )
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
@@ -8409,6 +8415,11 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            try:
+                from gateway.keryx_stream import register_keryx_routes
+                register_keryx_routes(self._app.router, self._check_auth)
+            except Exception:
+                logger.debug("keryx routes unavailable", exc_info=True)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

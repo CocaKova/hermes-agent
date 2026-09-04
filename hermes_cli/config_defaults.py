@@ -2863,6 +2863,15 @@ DEFAULT_CONFIG = {
         # 'target_busy' error. Deliveries are serialized per profile with a
         # cross-process file lock so two turns never race one Bot Chat.
         "turn_wait_seconds": 120,
+        # Hard cap (seconds) on ONE delivery turn's execution. turn_wait_seconds
+        # bounds only the wait to ACQUIRE the target's lock; the turn itself was
+        # unbounded, so a transport that answered and then failed to exit blocked
+        # forever — its reply was written to the target's own session store but
+        # never re-emitted, so no completion notification fired and the sender
+        # kept the optimistic 'sent' from dispatch (milo and theo, 2026-09-03:
+        # both replied at 22:51/22:52, neither reply ever surfaced). Generous on
+        # purpose: a real teammate turn can run half an hour. 0 disables the cap.
+        "delivery_timeout_seconds": 1800,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
