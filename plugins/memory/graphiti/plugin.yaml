@@ -1,0 +1,8 @@
+name: graphiti
+version: "1.0.0"
+description: "Graphiti temporal knowledge graph — Neo4j-backed, local 27B extraction + BGE-M3 embeddings, bi-temporal facts"
+author: local
+requires_services:
+  - neo4j (bolt 8687, container silas-neo4j)
+  - llm extractor (port 8000, qwen3.6-27b)
+  - embeddings (port 8889, bge-m3)
