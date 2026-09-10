@@ -1793,6 +1793,25 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # SILAS_SKILL_VIEW_CAP (silas_ext/reapply.py, 2026-09-07): a SKILL.md
+        # body lands in context as ONE tool result, bypassing tool_output caps.
+        # Bound it and point at the file; references/ are already on demand.
+        try:
+            _cap = int(os.environ.get("SILAS_SKILL_VIEW_MAX_CHARS", "24000"))
+        except Exception:
+            _cap = 24000
+        if _cap > 0 and len(rendered_content) > _cap:
+            _cut = rendered_content.rfind("\n", 0, _cap)
+            if _cut < _cap // 2:
+                _cut = _cap
+            rendered_content = (
+                rendered_content[:_cut]
+                + f"\n\n[SKILL BODY TRUNCATED — showing {_cut:,} of "
+                f"{len(rendered_content):,} chars. Full file: {skill_md}. If the part "
+                "you need is not above, read_file that path with offset= for the rest. "
+                "A skill this long should be split into references/ files.]"
+            )
+
         # ── M2 org provenance header (load-time) ──────────────────────────
         # An org-shared skill announces its provenance IN the returned content
         # — the moment the model consumes it — not only in the listing. The

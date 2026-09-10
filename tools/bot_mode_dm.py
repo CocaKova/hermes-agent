@@ -562,6 +562,69 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(home), argv[2])
 
 
+DEFAULT_DELIVERY_TIMEOUT_SECONDS = 1800
+
+
+def _delivery_timeout_seconds() -> Optional[int]:
+    """Configured cap on ONE delivery turn (``bot_mode.delivery_timeout_seconds``).
+
+    ``turn_wait_seconds`` bounds the wait to *acquire* the target's turn lock;
+    nothing bounded the turn itself, so a transport that answered and then
+    failed to exit blocked ``subprocess.run`` forever. The reply was already
+    written to the target's own session store, but stdout was never re-emitted,
+    the completion notification never fired, and the sending agent kept the
+    optimistic ``status: sent`` from dispatch — a silently lost conversation
+    (milo and theo, 2026-09-03: both replied, neither reply ever surfaced).
+
+    Generous by default: a legitimate teammate turn can run for half an hour
+    (sterling did, 35 API calls) and must not be cut off. ``0`` or negative
+    disables the cap and restores the old unbounded behaviour.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        val = (cfg.get("bot_mode") or {}).get("delivery_timeout_seconds")
+        if val is not None:
+            val = int(val)
+            return val if val > 0 else None
+    except Exception:
+        logger.debug("bot_mode delivery timeout config read failed", exc_info=True)
+    return DEFAULT_DELIVERY_TIMEOUT_SECONDS
+
+
+def _emit_partial(exc: "subprocess.TimeoutExpired") -> None:
+    """Re-emit a timed-out transport's captured streams before giving up.
+
+    ``TimeoutExpired`` carries whatever was read before the kill. When the turn
+    answered and then failed to exit, the answer is sitting in that buffer, so
+    forwarding it turns a silent loss into a delivered (if late) reply.
+    """
+    for buf, sink in ((exc.stdout, sys.stdout), (exc.stderr, sys.stderr)):
+        if not buf:
+            continue
+        try:
+            sink.write(buf.decode("utf-8", "replace") if isinstance(buf, bytes) else buf)
+            sink.flush()
+        except Exception:
+            logger.debug("partial delivery output could not be re-emitted", exc_info=True)
+
+
+class DeliveryTimeout(Exception):
+    """One delivery turn outran ``bot_mode.delivery_timeout_seconds``."""
+
+    reason = "delivery_timeout"
+
+    def __init__(self, label: str, seconds: int) -> None:
+        super().__init__(
+            f"Delivery turn exceeded {seconds}s and was stopped. The target may "
+            "have answered — check its own session before re-sending, so the "
+            "same message is not delivered twice."
+        )
+        self.label = label
+        self.seconds = seconds
+
+
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     """Run one DM transport and remove its plaintext file after consumption.
 
@@ -579,18 +642,32 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     """
     try:
         with _delivery_lock(argv, stdin_file=stdin_file):
+            budget = _delivery_timeout_seconds()
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
-                    return subprocess.run(argv, stdin=stream, check=False).returncode
-            proc = subprocess.run(
-                [*argv, "--query-file", dm_file],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-            )
+                    try:
+                        return subprocess.run(
+                            argv, stdin=stream, check=False, timeout=budget
+                        ).returncode
+                    except subprocess.TimeoutExpired:
+                        raise DeliveryTimeout(argv[2] if len(argv) > 2 else "?", budget)
+            try:
+                proc = subprocess.run(
+                    [*argv, "--query-file", dm_file],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=budget,
+                )
+            except subprocess.TimeoutExpired as timeout_exc:
+                # Re-emit whatever the transport managed to say before it hung:
+                # a turn that answered and then failed to exit has its reply in
+                # captured stdout, and losing it silently is the whole defect.
+                _emit_partial(timeout_exc)
+                raise DeliveryTimeout(argv[2] if len(argv) > 2 else "?", budget)
             if proc.returncode != 0:
                 from tools.bot_failure_reasons import (
                     RETRY_NONE,
@@ -600,13 +677,20 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
 
                 detail = (proc.stderr or proc.stdout or "").strip()[-500:]
                 if retry_action(classify_agent_error(detail)) != RETRY_NONE:
-                    proc = subprocess.run(
-                        [*argv, "--query-file", dm_file],
-                        check=False,
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                    )
+                    try:
+                        proc = subprocess.run(
+                            [*argv, "--query-file", dm_file],
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=budget,
+                        )
+                    except subprocess.TimeoutExpired as timeout_exc:
+                        _emit_partial(timeout_exc)
+                        raise DeliveryTimeout(
+                            argv[2] if len(argv) > 2 else "?", budget
+                        )
             # Re-emit the transport's streams: stdout is the reply text the
             # completion notification carries back to the sending agent.
             if proc.stdout:
@@ -739,8 +823,12 @@ def _delivery_main(args: list[str]) -> int:
         # structured payload on stdout so the completion notification carries
         # it back to the sending agent.
         reason = getattr(exc, "reason", "")
-        if reason == "target_busy":
-            print(json.dumps({"error": str(exc), "reason": "target_busy"}))
+        if reason in ("target_busy", "delivery_timeout"):
+            # Structured refusals ride stdout so the completion notification
+            # carries them back to the sending agent. Without this a delivery
+            # that outran its budget was indistinguishable from one still in
+            # flight, and the sender kept believing the optimistic "sent".
+            print(json.dumps({"error": str(exc), "reason": reason}))
             return 1
         print(
             f"message_agent delivery failed: {type(exc).__name__}: {exc}",

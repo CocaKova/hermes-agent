@@ -2071,13 +2071,36 @@ def _build_skills_system_prompt_inner(
         cat for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
+    # SILAS_SKILLS_INDEX_NAMES_ONLY (silas_ext/reapply.py, 2026-09-07): render
+    # every category names-only. The per-turn skill-hints bridge
+    # (SILAS_SKILL_HINTS_INJECT) supplies descriptions for the skills that
+    # match the current turn, so the always-on index only needs to keep every
+    # name visible. Categories listed one per line in
+    # ~/.hermes/silas_ext/skills_verbose_categories.txt keep full descriptions.
+    try:
+        _verbose_path = os.path.expanduser(
+            "~/.hermes/silas_ext/skills_verbose_categories.txt"
+        )
+        _verbose = frozenset()
+        if os.path.exists(_verbose_path):
+            with open(_verbose_path, encoding="utf-8") as _vf:
+                _verbose = frozenset(
+                    ln.strip() for ln in _vf if ln.strip() and not ln.startswith("#")
+                )
+        demoted = demoted | frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] not in _verbose
+        )
+    except Exception:
+        pass
 
     hidden_note = ""
     if demoted:
         hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+            "\n(Categories marked [names only] list skill names without "
+            "descriptions to keep this index short. Every skill works normally: "
+            "skill_view(name) loads it, skills_list shows descriptions, and the "
+            "skills relevant to the current message are described above.)"
         )
 
     if not skills_by_category:

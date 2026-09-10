@@ -913,6 +913,234 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return False
 
 
+
+# SILAS_SKILL_HINTS_HELPER (silas_ext/reapply.py): turn->skills keyword bridge.
+# The local brain reliably reads recalled memory but skips the 150-entry
+# <available_skills> index, so the 1-3 relevant skills are surfaced per-turn
+# next to the recall injection (see the skill-hints injection site below). The
+# snapshot is mtime-cached; aliases map everyday words to skills whose
+# descriptions do not contain them (e.g. "resume" -> google-workspace/Drive).
+_SILAS_SKILL_CACHE = {"mtime": 0.0, "skills": []}
+_SILAS_SKILL_ALIASES = {
+    "google-workspace": ("resume", "cv", "document", "documents", "file", "files",
+                         "spreadsheet", "appointment", "appointments", "schedule",
+                         "meeting", "meetings", "inbox", "mail", "email", "emails",
+                         "attachment", "attachments"),
+    "business-ops": ("invoice", "invoices", "quote", "quotes", "proposal", "client",
+                     "clients", "lead", "leads", "customer", "customers"),
+    "financial-budget": ("budget", "savings", "spending", "transactions", "balance"),
+}
+_SILAS_SKILL_STOP = frozenset(
+    "the a an and or of to in on for with from via my your his her its our their "
+    "can could you please i me we it is are was were be been what when where how "
+    "which who why find get make do does did have has had this that these those "
+    "new use using used other any all some skills skill tools tool manage create "
+    "managing creating build building check checks checking look looking see send "
+    "sending show tell give take run help need want know think going come got today "
+    "tomorrow tonight yesterday now just like also about at as by so not no up out "
+    "off over".split()
+)
+# How much of the conversation tail counts as "what this turn is about", and the
+# hard cap on text handed to the matcher so a long transcript can't slow a turn.
+_SILAS_SKILL_CTX_MSGS = 6
+_SILAS_SKILL_CTX_CHARS = 4000
+
+
+def _silas_skill_words(text):
+    # Hyphenated tokens are also indexed by their parts: a skill described as a
+    # "personal-cloud file operation" has to match someone saying "personal
+    # cloud", which the single-token form never did.
+    import re as _re
+    raw = set(_re.findall(r"[a-z0-9][a-z0-9-]+", text.lower()))
+    out = set(raw)
+    for _w in raw:
+        if "-" in _w:
+            out.update(_p for _p in _w.split("-") if len(_p) > 1)
+    return out - _SILAS_SKILL_STOP
+
+
+def _silas_skill_message_text(msg):
+    """Best-effort text for one API message: content plus tool-call arguments."""
+    out = []
+    _c = msg.get("content")
+    if isinstance(_c, str):
+        out.append(_c)
+    elif isinstance(_c, list):
+        out.extend(str(p.get("text") or "") for p in _c if isinstance(p, dict))
+    for _tc in (msg.get("tool_calls") or ()):
+        if not isinstance(_tc, dict):
+            continue
+        _fn = _tc.get("function")
+        if isinstance(_fn, dict):
+            out.append(str(_fn.get("name") or ""))
+            out.append(str(_fn.get("arguments") or "")[:400])
+    return " ".join(p for p in out if p)
+
+
+def _silas_skill_turn_text(api_messages, prefetch, scope="user"):
+    """The text this turn's hints are matched against.
+
+    scope="user": the latest user message + recall prefetch. Byte-stable for
+    the whole turn, so the block stamped into the user message's api_content
+    sidecar never changes under the prefix cache.
+    scope="tail": only what came AFTER the latest user message (assistant
+    text, tool-call arguments, tool results; last _SILAS_SKILL_CTX_MSGS). A
+    need that surfaces mid-run (a service, a credential) shows up here.
+    """
+    msgs = [m for m in api_messages if isinstance(m, dict)]
+    last_user = None
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            last_user = i
+            break
+    parts = []
+    if scope == "tail":
+        tail = msgs[last_user + 1:] if last_user is not None else msgs
+        for _m in reversed(tail[-_SILAS_SKILL_CTX_MSGS:]):
+            _t = _silas_skill_message_text(_m)
+            if _t:
+                parts.append(_t)
+    else:
+        if last_user is not None:
+            _t = _silas_skill_message_text(msgs[last_user])
+            if _t:
+                parts.append(_t)
+        if prefetch:
+            parts.append(str(prefetch))
+    # Most recent text is joined first, so the cap trims the stalest end.
+    return " ".join(parts)[:_SILAS_SKILL_CTX_CHARS]
+
+
+def _silas_skill_frontmatter_desc(path):
+    """Full `description:` from a SKILL.md front matter (single or folded)."""
+    import re as _re
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(4000)
+    except OSError:
+        return ""
+    if not head.startswith("---"):
+        return ""
+    end = head.find("\n---", 3)
+    fm = head[3:end] if end != -1 else head[3:]
+    out = []
+    grabbing = False
+    for line in fm.splitlines():
+        if not grabbing:
+            m = _re.match(r"\s*description\s*:\s*(.*)$", line)
+            if m:
+                _head = m.group(1).strip().strip("'\"")
+                # `description: >` / `|` opens a YAML block scalar; the marker
+                # itself is not text, the indented lines under it are.
+                if _head not in (">", "|", ">-", "|-", ">+", "|+"):
+                    out.append(_head)
+                grabbing = True
+            continue
+        if _re.match(r"\s*[A-Za-z_][A-Za-z0-9_-]*\s*:", line):
+            break
+        if line.strip():
+            out.append(line.strip())
+    return " ".join(out).strip()
+
+
+def _silas_skill_desc_map():
+    """skill dir name -> full description, read from disk.
+
+    The prompt snapshot stores descriptions already clipped to
+    SKILL_PROMPT_DESC_LIMIT (60 chars), so matching against it never sees most
+    of what a skill says it does — 'nextcloud' lost the words "personal-cloud
+    file operation" and stopped matching anyone who asked for a personal
+    cloud. Rebuilt only when the snapshot mtime changes, so this is cold-path.
+    """
+    import glob as _glob
+    import os as _os
+    out = {}
+    root = _os.path.expanduser("~/.hermes/skills")
+    try:
+        for _p in _glob.iglob(_os.path.join(root, "**", "SKILL.md"), recursive=True):
+            _d = _silas_skill_frontmatter_desc(_p)
+            if _d:
+                out[_os.path.basename(_os.path.dirname(_p))] = _d
+    except Exception:
+        pass
+    return out
+
+
+def _silas_skill_hints_block(api_messages, prefetch, scope="user"):
+    import json as _json
+    import os as _os
+    path = _os.path.expanduser("~/.hermes/.skills_prompt_snapshot.json")
+    try:
+        mtime = _os.path.getmtime(path)
+    except OSError:
+        return ""
+    if mtime != _SILAS_SKILL_CACHE["mtime"]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                entries = _json.load(fh).get("skills") or []
+        except Exception:
+            return ""
+        full_descs = _silas_skill_desc_map()
+        skills = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("frontmatter_name") or e.get("skill_name") or "")
+            if not name:
+                continue
+            desc = str(e.get("description") or "")
+            # Match on the full description, display a bounded slice of it: the
+            # snapshot's 60-char clip is too thin to match on, and the whole
+            # thing is too fat to paste into every turn.
+            full = full_descs.get(str(e.get("skill_name") or "")) or full_descs.get(name) or ""
+            if full:
+                desc = full if len(full) <= 200 else full[:197] + "..."
+            words = _silas_skill_words(name + " " + (full or desc) + " " + str(e.get("category") or ""))
+            name_words = _silas_skill_words(name.replace("-", " ") + " " + name)
+            alias_words = set(_SILAS_SKILL_ALIASES.get(name, ()))
+            skills.append((name, desc, words, name_words, alias_words))
+        _SILAS_SKILL_CACHE["skills"] = skills
+        _SILAS_SKILL_CACHE["mtime"] = mtime
+    query = _silas_skill_words(_silas_skill_turn_text(api_messages, prefetch, scope))
+    if not query:
+        return ""
+    # Tail hints only add what the user-scope block did not already surface.
+    _already = set()
+    if scope == "tail":
+        _uq = _silas_skill_words(_silas_skill_turn_text(api_messages, prefetch, "user"))
+        for _n, _d, _w, _nw, _aw in _SILAS_SKILL_CACHE["skills"]:
+            if len(_uq & _w) + 2 * len(_uq & _nw) + 2 * len(_uq & _aw) >= 2:
+                _already.add(_n)
+    # Never hint a DISABLED skill. The snapshot is built from everything on
+    # disk and ignores skills.disabled, so 6 of the 9 disabled skills were still
+    # being recommended. Evidenced 2026-08-06: the model was hinted
+    # 'blogwatcher' and 'codebase-inspection', called skill_view on both, and
+    # got errors back — a wasted turn caused entirely by the hint.
+    # Resolved here rather than at cache-build time on purpose: the cache is
+    # keyed on the snapshot's mtime, so filtering there would go stale whenever
+    # skills.disabled changes without the snapshot changing.
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        _disabled = get_disabled_skill_names() or set()
+    except Exception:
+        _disabled = set()
+    scored = []
+    for name, desc, words, name_words, alias_words in _SILAS_SKILL_CACHE["skills"]:
+        if name in _disabled or name in _already:
+            continue
+        score = (len(query & words)
+                 + 2 * len(query & name_words)
+                 + 2 * len(query & alias_words))
+        if score >= 2:
+            scored.append((score, name, desc))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    lines = ["- %s: %s" % (n, d) if d else "- %s" % n for _, n, d in scored[:3]]
+    return ("<skill-hints>\nSkills that look relevant to this request — load with "
+            "skill_view(name) BEFORE answering from memory or searching the "
+            "filesystem:\n" + "\n".join(lines) + "\n</skill-hints>")
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 

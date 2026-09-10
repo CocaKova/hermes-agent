@@ -158,6 +158,20 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    # SILAS_SKILL_HINTS_USER (silas_ext/reapply.py, 2026-09-07): per-turn skill
+    # hints ride the user message exactly like recall does. Composed here so the
+    # prologue stamps them into the api_content sidecar and turn N+1 replays the
+    # same bytes — the prefix cache holds across turns. Lazy import: this module
+    # is imported by conversation_loop, which is where the helper lives.
+    try:
+        from agent.conversation_loop import _silas_skill_hints_block as _silas_hints
+        _hint_block = _silas_hints(
+            [{"role": "user", "content": content}], ext_prefetch_cache, scope="user"
+        )
+    except Exception:
+        _hint_block = ""
+    if _hint_block:
+        injections.append(_hint_block)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)

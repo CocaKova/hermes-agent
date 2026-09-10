@@ -795,6 +795,33 @@ def _dashboard_public_hosts() -> frozenset[str]:
     return frozenset({hostname.lower()})
 
 
+def _ws_peer_may_be_remote(host: str) -> bool:
+    """True when a WebSocket peer on this bind can be other than a local client.
+
+    SILAS_WS_PING_FRONTED_BIND (silas_ext/reapply.py, 2026-09-09).
+
+    A loopback BIND is not proof of a loopback PEER. When a proxy terminates
+    the client connection and dials 127.0.0.1 itself (Tailscale Serve,
+    Cloudflare Tunnel, nginx), the socket uvicorn owns belongs to the PROXY,
+    not to the client, and it stays healthy indefinitely after the real client
+    dies. That is exactly the half-open case the keepalive ping exists to
+    catch, and no FIN/RST can surface it because the proxy's own socket never
+    closed. Keying the ping off the bind address alone therefore leaves a
+    proxied backend with no liveness check at all.
+
+    ``dashboard.public_url`` is the deployment's existing declaration that such
+    a front is in the path -- it is already what engages the auth gate for a
+    loopback backend (see ``should_require_dashboard_auth``). Reuse that one
+    fact here so exposure and liveness never disagree.
+    """
+    if host not in _LOOPBACK_HOST_VALUES:
+        return True
+    return any(
+        candidate not in _LOOPBACK_HOST_VALUES
+        for candidate in _dashboard_public_hosts()
+    )
+
+
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
@@ -19785,7 +19812,13 @@ def start_server(
     # (idle timeout ~100s) where half-open IS a real failure mode, so keep the
     # ping at 20/20 to detect it promptly and stay under the tunnel's idle
     # window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
+    # SILAS_WS_PING_PEER_REACHABILITY (silas_ext/reapply.py, 2026-09-09):
+    # supersedes the "cannot happen on loopback" reasoning above for any
+    # bind that a proxy fronts. The paragraph is right that a DIRECT local
+    # client dies with a real FIN/RST; it is wrong that a loopback bind
+    # implies a direct local client. Decide on whether a remote peer can
+    # reach this bind at all, not on the address it happens to listen on.
+    _ws_peer_remote = _ws_peer_may_be_remote(host)
     # Non-loopback ping cadence is config-driven (dashboard.ws_ping_interval /
     # dashboard.ws_ping_timeout, #79635); the 20/20 defaults keep the
     # Cloudflare-Tunnel-friendly behaviour when unset or invalid.
@@ -19816,12 +19849,21 @@ def start_server(
         # metadata without accepting spoofed X-Forwarded-* headers from every
         # caller.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
-        # Half-open detection for public binds only (see above). Loopback
-        # disables the protocol ping (None) so an event-loop stall can never
-        # trigger a false disconnect; a genuinely dead local client is still
-        # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else _ws_ping_setting("ws_ping_interval"),
-        ws_ping_timeout=None if _is_loopback else _ws_ping_setting("ws_ping_timeout"),
+        # SILAS_WS_PING_FRONTED_ARGS (silas_ext/reapply.py, 2026-09-09):
+        # half-open detection wherever a peer can be remote -- a proxied
+        # loopback backend included. A direct-only bind still disables the
+        # ping (None) so an event-loop stall cannot trigger a false
+        # disconnect; there, a dead client is reaped via the
+        # WebSocketDisconnect → disconnect/reap path instead. Where the ping
+        # IS on, cadence is config-driven, so a deployment with long
+        # GIL-holding turns can widen the pong window past its stalls
+        # (dashboard.ws_ping_interval / dashboard.ws_ping_timeout).
+        ws_ping_interval=(
+            _ws_ping_setting("ws_ping_interval") if _ws_peer_remote else None
+        ),
+        ws_ping_timeout=(
+            _ws_ping_setting("ws_ping_timeout") if _ws_peer_remote else None
+        ),
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)

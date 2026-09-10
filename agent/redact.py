@@ -196,8 +196,19 @@ _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 # ``os.environ.get(...)``, ``process.env.X``, ``$ENV{X}``) reference variable
 # *names*, not secret values. When one appears as the VALUE of a KEY=... match
 # it's a code snippet, not a leaked secret — skip redaction (issue #2852).
+# SILAS_PLACEHOLDER_REDACT_GUARD (silas_ext/reapply.py, 2026-09-07): a
+# ``${VAR}`` reference is a NAME, not a secret — the value lives in .env and
+# never appears in the text. Masking it produced
+# ``Authorization: Bearer ${MCP_...KEY}`` on read; the agent then wrote that
+# masked form back and permanently corrupted config.yaml (Context7 MCP,
+# 09-07). Same reasoning as the os.getenv/process.env carve-out below it,
+# extended to the shell/config placeholder form (optionally behind an auth
+# scheme word). A value mixing a placeholder WITH literal text still
+# redacts — the trailing ``$`` anchor requires placeholders to the end.
 _ENV_LOOKUP_VALUE_RE = re.compile(
-    r"^(?:os\.(?:getenv|environ)|process\.env|\$ENV\{)"
+    r"(?:os\.(?:getenv|environ)|process\.env|\$ENV\{)"
+    r"|(?:(?:Bearer|Basic|Token|JWT|ApiKey)\s+)?(?:\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*)+$",
+    re.IGNORECASE,
 )
 # Namespaced (dotted) key: the secret word may sit anywhere in a dotted path.
 # NOTE(perf): possessive quantifiers (py3.11+) replace the nested quantifier
@@ -931,8 +942,14 @@ def redact_sensitive_text(
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
+        # SILAS_PLACEHOLDER_REDACT_HEADERS (silas_ext/reapply.py, 2026-09-07):
+        # never mask a ``${VAR}`` placeholder — it is a reference, not a
+        # credential, and masking it corrupts config the agent later rewrites.
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            lambda m: m.group(1) + (m.group(2) or "") + (
+                m.group(3) if _ENV_LOOKUP_VALUE_RE.match(m.group(3))
+                else _mask_token(m.group(3))
+            ),
             text,
         )
 
@@ -940,7 +957,10 @@ def redact_sensitive_text(
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask_token(m.group(2)),
+            lambda m: m.group(1) + (
+                m.group(2) if _ENV_LOOKUP_VALUE_RE.match(m.group(2))
+                else _mask_token(m.group(2))
+            ),
             text,
         )
 

@@ -4263,6 +4263,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         )
                 break
 
+            # keryx_stream: a pending /steer during a text-only completion ends the
+            # stream here — the partial answer commits and the steer becomes the
+            # immediate next turn instead of waiting out the full answer. The size
+            # floor keeps a just-started answer streaming (a first-token break
+            # committed bare fragments like "The" as real messages); short answers
+            # finish on their own and the steer lands via the leftover path.
+            if (
+                getattr(agent, "_pending_steer", None)
+                and not tool_calls_acc
+                and sum(len(_p) for _p in content_parts) >= 120
+            ):
+                finish_reason = "stop"
+                break
+
             if not _stream_attempt_is_active(stream_attempt_id):
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
@@ -4595,10 +4609,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # text content but no tool calls.  Without this guard the partial
         # text is silently stamped finish_reason="stop" and the turn ends as
         # if complete — the model's intended next step is lost (#32086).
+        # SILAS_STREAM_USAGE_PROVES_FINISH (silas_ext/reapply.py): backport of
+        # upstream #91373 (2026-08-21) — a final usage chunk (include_usage's
+        # terminal frame) proves the provider finished, so a stream that ends
+        # with usage but no finish_reason is a clean end, not a drop. Without
+        # this the loop injects the "cut off by a network error mid-stream"
+        # stub and burns a continuation call on an already-complete answer.
         _text_only_dropped_no_finish = (
             finish_reason is None
             and content_parts
             and not tool_calls_acc
+            and usage_obj is None
         )
         if _text_only_dropped_no_finish:
             logger.warning(

@@ -10787,6 +10787,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       AND parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._reset_from') IS NULL -- SILAS_RESET_FENCE_TIP
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -11072,6 +11073,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     WHERE parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._reset_from') IS NULL -- SILAS_RESET_FENCE_LIST
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (

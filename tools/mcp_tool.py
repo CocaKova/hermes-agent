@@ -6184,11 +6184,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # SILAS_MCP_WATCH_PROBE (silas_ext/reapply.py, 2026-09-07):
+                    # upstream probed awaitability by CALLING the watcher,
+                    # which created a coroutine that was never awaited
+                    # ("coroutine '_watch_stdio_children' was never awaited"
+                    # on every MCP call). Create it once, race THAT object
+                    # below, and close it when the race is skipped.
+                    _watch_probe = (
+                        _watch_children() if _watch_children is not None else None
+                    )
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        inspect.isawaitable(_watch_probe)
                         and asyncio.iscoroutine(_call_coro)
                     )
+                    if not _watch_ok and asyncio.iscoroutine(_watch_probe):
+                        _watch_probe.close()
                     if not _watch_ok:
                         # Stubbed sessions (MagicMock in tests) return a
                         # non-awaitable, or there is no child-watcher to race
@@ -6205,7 +6215,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_probe)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},

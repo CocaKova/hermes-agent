@@ -1165,10 +1165,15 @@ SESSION_SEARCH_SCHEMA = {
             "query": {
                 "type": "string",
                 "description": (
-                    "Search query (discovery shape). Keywords, phrases, or boolean "
-                    "expressions to find in past sessions. Omit to browse recent "
-                    "sessions. Ignored when session_id + around_message_id are set "
-                    "(scroll shape)."
+                    # SILAS_SS_QUERY_DISCIPLINE (silas_ext/reapply.py)
+                    "Search query (discovery shape). Use 1-3 DISTINCTIVE nouns "
+                    "(project names, filenames, hostnames, error strings): every "
+                    "term is ANDed, so generic-verb soups match noise. Operators "
+                    "are UPPERCASE ONLY (`alpha OR beta`, `python NOT java`, "
+                    "`\"exact phrase\"`, `deploy*`) — lowercase or/and/not are "
+                    "searched as words. Zero or junk results: re-check spelling, "
+                    "then retry with FEWER terms — never add words to a failing "
+                    "query. Omit to browse recent sessions; ignored in scroll shape."
                 ),
             },
             "limit": {
@@ -1184,9 +1189,11 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["newest", "oldest"],
                 "description": (
-                    "Discovery shape only. Temporal bias on top of FTS5 ranking: omit "
-                    "for relevance-only (exploratory recall), 'newest' for "
-                    "\"where did we leave X\", 'oldest' for \"how did X start\"."
+                    # SILAS_SS_SORT_WARNING (silas_ext/reapply.py)
+                    "Discovery shape only. WARNING: REPLACES relevance ranking with "
+                    "pure timestamp order (match quality only breaks ties). Omit for "
+                    "nearly all searches; 'newest' only for the LATEST occurrence "
+                    "(\"where did we leave X\"), 'oldest' only for origins."
                 ),
             },
             "detail": {

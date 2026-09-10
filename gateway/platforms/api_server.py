@@ -1486,6 +1486,15 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+def _silas_disabled_toolsets(user_config):
+    """SILAS_API_SERVER_DISABLED_TOOLSETS helper: profile-scoped agent.disabled_toolsets."""
+    try:
+        from agent.skill_utils import parse_config_string_list
+        agent_cfg = (user_config.get("agent") or {}) if isinstance(user_config, dict) else {}
+        return parse_config_string_list(agent_cfg.get("disabled_toolsets")) or None
+    except Exception:
+        return None
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -3125,6 +3134,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            # SILAS_API_SERVER_DISABLED_TOOLSETS: native platforms pass the profile's
+            # agent.disabled_toolsets; this surface must too, or per-profile MCP gating
+            # is silently ignored for API-server clients.
+            "disabled_toolsets": _silas_disabled_toolsets(user_config),
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -4584,6 +4597,12 @@ class APIServerAdapter(BasePlatformAdapter):
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
+            # SILAS_FORK_BRANCH_MARKER (silas_ext/reapply.py): the stable marker
+            # keeps the fork listable. end_session(source,'branched') above no-ops
+            # on an already-ended source, so the legacy heuristic never holds for
+            # forks of completed sessions and they were hidden as ephemeral
+            # children. Same marker the gateway's /branch writes at create time.
+            model_config={"_branched_from": source_id},
         )
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
@@ -7770,6 +7789,11 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            try:
+                from gateway.keryx_stream import register_keryx_routes
+                register_keryx_routes(self._app.router, self._check_auth)
+            except Exception:
+                logger.debug("keryx routes unavailable", exc_info=True)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
