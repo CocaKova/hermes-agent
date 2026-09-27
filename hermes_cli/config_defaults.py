@@ -1938,8 +1938,10 @@ DEFAULT_CONFIG = {
         # profile with a cross-process file lock.
         "turn_wait_seconds": 120,
         # Cap on ONE CLI delivery turn into a teammate. A target that answers and then never exits
-        # is stopped here: any reply it printed is forwarded and the sender gets a structured
-        # 'delivery_timeout' error instead of a silent loss. 0 = no cap.
+        # is stopped here (with its whole process tree): any reply it printed is forwarded and the
+        # sender gets a structured 'delivery_timeout' error instead of a silent loss. It bounds the
+        # process, so it covers a relay-length turn (600s) plus the one-shot exit linger
+        # (terminal.oneshot_completion_wait_seconds, 600s). 0 or negative = explicit opt-out, no cap.
         "delivery_timeout_seconds": 1800,
     },
     "code_execution": {  # execute_code settings (programmatic tool calls).

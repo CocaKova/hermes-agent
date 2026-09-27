@@ -1743,8 +1743,9 @@ stt:
 # Bot Mode (teammate messaging)
 # =============================================================================
 bot_mode:
-  delivery_timeout_seconds: 1800   # Cap on one CLI delivery turn into a teammate; a hung target is
-                                   # stopped with a 'delivery_timeout' error (0 = no cap)
+  delivery_timeout_seconds: 1800   # Cap on one CLI delivery process into a teammate (turn + exit
+                                   # linger); a hung target and its child processes are stopped with
+                                   # a 'delivery_timeout' error. 0 = no cap (explicit opt-out)
 
 # =============================================================================
 # Code Execution Sandbox (Programmatic Tool Calling)

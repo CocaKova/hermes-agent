@@ -424,8 +424,9 @@ def _delivery_timeout_seconds() -> Optional[int]:
     ``turn_wait_seconds`` only bounds the wait for the target's turn lock. A transport that
     answered and then never exited blocked ``subprocess.run`` forever: the reply was never
     re-emitted, no completion notification fired, and the sender kept the optimistic "sent".
-    Generous by default because a real teammate turn can run for many minutes; ``0`` or
-    negative disables the cap."""
+    It bounds the PROCESS, so the default covers a relay-length turn (``TURN_ATTEMPT_TIMEOUT_SECONDS``)
+    plus the one-shot exit linger for nested replies (``terminal.oneshot_completion_wait_seconds``,
+    600s by default) with margin. ``0`` or negative is an explicit opt-out: no cap."""
     from tools.bot_relay import _bot_mode_cfg
 
     val = _bot_mode_cfg("delivery_timeout_seconds", loader="load_config_readonly")
@@ -461,6 +462,40 @@ def _emit_partial(exc: subprocess.TimeoutExpired) -> None:
                 sink.flush()
 
 
+# After the tree kill, how long the capture pipes may take to reach EOF before they are abandoned.
+_KILL_DRAIN_SECONDS = 5.0
+
+
+def _run_bounded(cmd: list[str], *, timeout: Optional[int], input: Optional[bytes] = None,
+                 capture_output: bool = False, **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run(cmd, timeout=...)`` whose timeout always returns.
+
+    On Windows ``run()`` kills only the direct child and then waits on the pipes with an unbounded
+    ``communicate()``; a delivery turn is a full agent turn, so a stdio-inheriting grandchild
+    (kernel, terminal, MCP) kept the pipes open and the timeout never surfaced. Here the whole tree
+    is killed at the cap on every OS and the post-kill drain is bounded, as in ``bounded_probe_run``.
+    No Job Object: KILL_ON_JOB_CLOSE would also end whatever a turn that finished normally left
+    running on purpose. The raised ``TimeoutExpired`` carries whatever output was captured."""
+    from hermes_cli._subprocess_compat import kill_process_tree
+
+    if capture_output:
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        kill_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=_KILL_DRAIN_SECONDS)
+        except subprocess.TimeoutExpired as drained:
+            # Something outside the tree still holds the pipes: keep what arrived, abandon the rest.
+            stdout, stderr = drained.stdout or exc.stdout, drained.stderr or exc.stderr
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
     """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
     the transport's streams and returns its exit code. Transient failures re-run the
@@ -471,9 +506,9 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
     def _turn(turn_env=env):
         try:
-            return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                  env=turn_env, timeout=budget)
+            return _run_bounded([*argv, "--query-file", dm_file], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                env=turn_env, timeout=budget)
         except subprocess.TimeoutExpired as exc:
             _emit_partial(exc)
             raise DeliveryTimeout(budget) from None
@@ -626,13 +661,13 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             if not stdin_file:
                 return _run_local_turn(argv, dm_file, env=env)
             # Keep the file open until the transport exits; cleanup occurs
-            # after subprocess.run returns, not merely after stdin reaches EOF.
+            # after the transport returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
                 # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
                 budget = _delivery_timeout_seconds()
                 try:
-                    return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env,
-                                          timeout=budget).returncode
+                    return _run_bounded(argv, input=stream.read().encode("utf-8"), env=env,
+                                        timeout=budget).returncode
                 except subprocess.TimeoutExpired:
                     # Not piped: the transport inherited this runner's stdout/stderr, so its output already went out.
                     raise DeliveryTimeout(budget) from None
