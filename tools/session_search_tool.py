@@ -690,10 +690,11 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["newest", "oldest"],
                 "description": (
-                    "Discovery shape only. Replaces relevance ranking with pure "
-                    "timestamp order (match quality only breaks ties), so omit it for "
-                    "exploratory recall. 'newest' for \"where did we leave X\", "
-                    "'oldest' for \"how did X start\"."
+                    "Discovery shape only. Orders matches by timestamp instead of "
+                    "relevance (match quality only breaks ties), so omit it for "
+                    "exploratory recall. An exact title match still comes first and "
+                    "cron sessions still follow interactive ones. 'newest' for "
+                    "\"where did we leave X\", 'oldest' for \"how did X start\"."
                 ),
             },
             "detail": {
@@ -713,7 +714,7 @@ SESSION_SEARCH_SCHEMA = {
                     "Discovery shape only. Inclusive lower bound on session start "
                     "time. ISO date/datetime (e.g. 2026-06-01) or relative duration "
                     "(7d, 24h, 2w = within the last N). Use only when the user names "
-                    "a time frame. sort is a ranking bias, not a bound."
+                    "a time frame. sort only orders results, it is not a bound."
                 ),
             },
             "before": {
