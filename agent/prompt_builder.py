@@ -1120,8 +1120,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2 added org provenance fields (org_id/org_author); older snapshots are rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 3
+# v2 added org provenance fields (org_id/org_author); v4 adds skill_path for collision labels.
+# Older snapshots are rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1201,6 +1202,8 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
     platforms = [platforms] if isinstance(platforms, str) else platforms
     entry = {
         "skill_name": skill_name, "category": category, "frontmatter_name": str(frontmatter.get("name", skill_name)),
+        # Path under the skills dir (``_org/<id>/...`` included): the id skill_view accepts when the name is ambiguous.
+        "skill_path": skill_file.parent.relative_to(skills_dir).as_posix(),
         "description": description, "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
         "requires_apps": _requires_apps_list(frontmatter),
@@ -1338,6 +1341,9 @@ def _collect_extra_skills(
             logger.debug(log_fmt, skill_file, e)
 
 
+_COLLISION_LABEL = "[name collision"
+
+
 def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict[str, list[tuple[str, str]]]) -> None:
     """Org labeling + FAIL-LOUD collisions: a personal/org name clash flags BOTH
     entries (neither silently wins) and skill_view refuses the bare name."""
@@ -1351,7 +1357,10 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
             desc = f"[org-shared{': by ' + author if author else ''}] {desc}".strip()
         category = f"org:{org_id}" if org_id else (entry.get("category") or "general")
         if len(name_owners[fm]) > 1:
-            desc = f"[name collision — also exists {'personally' if org_id else 'in your org'}; load via category path] {desc}".strip()
+            # skill_view refuses the bare name, so print the exact path that loads THIS copy.
+            path = entry.get("skill_path")
+            load = f'load with skill_view("{path}")' if path else "load via its path"
+            desc = f"{_COLLISION_LABEL} — also exists {'personally' if org_id else 'in your org'}; {load}] {desc}".strip()
         skills_by_category.setdefault(category, []).append((fm, desc))
 
 
@@ -1383,7 +1392,12 @@ def _render_skills_index(
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
         if category in demoted:
-            index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
+            # A colliding name keeps its labelled line: the bare name does not load, and a names-only
+            # line would hide both the ambiguity and the path that does.
+            ambiguous = sorted({(n, d) for n, d in entries if d.startswith(_COLLISION_LABEL)})
+            plain = sorted({n for n, _ in entries} - {n for n, _ in ambiguous})
+            index_lines.append(f"  {category} [names only]: {', '.join(plain)}".rstrip())
+            index_lines.extend(f"    - {name}: {desc}" for name, desc in ambiguous)
             continue
         cat_desc = category_descriptions.get(category, "")
         index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")

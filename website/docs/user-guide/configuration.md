@@ -821,7 +821,7 @@ skills:
   index_descriptions: names_only   # default: full
 ```
 
-Every category is then listed as `category [names only]: skill-a, skill-b`. Nothing is hidden: `skills_list` and `skill_view(name)` work as usual.
+Every category is then listed as `category [names only]: skill-a, skill-b`. Nothing is hidden: `skills_list` and `skill_view(name)` work as usual. The one exception is a name that exists both personally and in your org: `skill_view` refuses that bare name, so each copy keeps its full line with the `[name collision …]` label and the exact path to load it.
 
 ### Guard on agent-created skill writes
 
