@@ -831,6 +831,8 @@ skills:
 
 Every category is then listed as `category [names only]: skill-a, skill-b`. Nothing is hidden: `skill_view(name)` loads the full skill and `skills_list(category)` lists a category with its descriptions. Trusted project skills keep their full `[project]` line, since they override same-named skills. Any other value (`names-only`, `names`, a typo) logs a warning and the index stays `full`.
 
+With `names_only` the model picks a skill by its name alone, so vague names (`research`, `analyze`) rarely get loaded even though `skills_list` still finds them. Rename those before switching.
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:
