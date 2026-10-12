@@ -831,7 +831,7 @@ skills:
 
 Every category is then listed as `category [names only]: skill-a, skill-b`. Nothing is hidden: `skill_view(name)` loads the full skill and `skills_list(category)` lists a category with its descriptions. Trusted project skills keep their full `[project]` line, since they override same-named skills. Any other value (`names-only`, `names`, a typo) logs a warning and the index stays `full`.
 
-With `names_only` the model picks a skill by its name alone, so vague names (`research`, `analyze`) rarely get loaded even though `skills_list` still finds them. Rename those before switching.
+With `names_only` the model chooses from names alone, so vague names (`research`, `analyze`) rarely get loaded even though `skills_list` still finds them. The model can still open a skill it can't place by name with `skill_view(name)`, so only rename the ones that say nothing about what they do.
 
 ### Guard on agent-created skill writes
 
