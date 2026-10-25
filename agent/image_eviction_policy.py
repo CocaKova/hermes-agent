@@ -31,6 +31,13 @@ request on 200K-context models, 600 otherwise) and the 32 MB request-size limit 
 first, which the byte budget guards with headroom for text. Classification reads image HEADERS
 only — never a full decode of every base64 payload per request — and treats unreadable or unknown
 dimensions as unsafe, so a payload this module cannot measure keeps today's strict trigger.
+
+Endpoints that are not Anthropic can refuse far below these ceilings: a vLLM server started with
+``--limit-mm-per-prompt`` answers a request over its image count with a 400 that is not retried.
+Their real limit is declared per model (``max_images``, resolved by
+``agent.image_routing.max_images_override``) and passed in as ``cap``; it only ever LOWERS the
+ceiling, and the batching, latch and floor below apply unchanged, so a capped route still pays one
+prefix rewrite per batch rather than one per image.
 """
 
 from __future__ import annotations
@@ -140,9 +147,11 @@ def images_all_within_many_image_limit(datas: Iterable[Optional[str]]) -> bool:
     return True
 
 
-def outbound_image_block_limit(many_image_safe: bool) -> int:
-    """Block ceiling for a request: the strict 20 unless every image is within the many-image cap."""
-    return OUTBOUND_IMAGE_HARD_LIMIT if many_image_safe else OUTBOUND_IMAGE_LIMIT
+def outbound_image_block_limit(many_image_safe: bool, cap: Optional[int] = None) -> int:
+    """Block ceiling for a request: the strict 20 unless every image is within the many-image cap,
+    and never above the endpoint's declared ``cap`` (see the module docstring)."""
+    ceiling = OUTBOUND_IMAGE_HARD_LIMIT if many_image_safe else OUTBOUND_IMAGE_LIMIT
+    return min(ceiling, cap) if cap else ceiling
 
 
 def outbound_image_retire_count(
@@ -152,6 +161,7 @@ def outbound_image_retire_count(
     carrier_bytes_newest_first: Optional[Sequence[int]] = None,
     reserved_bytes: int = 0,
     many_image_safe: bool = False,
+    cap: Optional[int] = None,
     limit: Optional[int] = None,
     budget: int = OUTBOUND_IMAGE_BUDGET_BYTES,
     batch: int = IMAGE_EVICTION_BATCH,
@@ -162,8 +172,8 @@ def outbound_image_retire_count(
     ``carrier_blocks_newest_first`` is the image-block count per image-bearing tool result,
     newest first; ``reserved_blocks`` counts images the pass must never rewrite (user
     uploads). The byte dimension is active only when ``carrier_bytes_newest_first`` is
-    given. ``limit`` defaults to :func:`outbound_image_block_limit` of ``many_image_safe``,
-    so both passes pick the same ceiling from the same per-request classification.
+    given. ``limit`` defaults to :func:`outbound_image_block_limit` of ``many_image_safe`` and
+    ``cap``, so both passes pick the same ceiling from the same per-request classification.
 
     The retire count must be a STEP FUNCTION of the overshoot, because the pass is recomputed
     on every request: an exact ``count - limit`` target moves the frontier on every new image,
@@ -185,7 +195,7 @@ def outbound_image_retire_count(
     cached prefix is rewritten once per quantum rather than on every new image.
     """
     if limit is None:
-        limit = outbound_image_block_limit(many_image_safe)
+        limit = outbound_image_block_limit(many_image_safe, cap)
     total = len(carrier_blocks_newest_first)
     sizes = carrier_bytes_newest_first
     return max(

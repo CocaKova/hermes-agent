@@ -161,8 +161,9 @@ def assemble_api_request(
     # place; persisted history is untouched.
     from agent.context_compressor import evict_stale_outbound_tool_images
     from agent.image_eviction_policy import outbound_retired_image_ids
+    from agent.image_routing import outbound_image_cap
 
-    evict_stale_outbound_tool_images(api_messages, outbound_retired_image_ids(agent))
+    evict_stale_outbound_tool_images(api_messages, outbound_retired_image_ids(agent), cap=outbound_image_cap(agent))
 
     # One-time repeated-heal notice goes out via the status/warning callback, NEVER
     # appended to messages: the cached prompt prefix stays byte-identical.

@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from agent.image_routing import (
     _coerce_capability_bool,
@@ -16,6 +17,8 @@ from agent.image_routing import (
     build_native_content_parts,
     decide_image_input_mode,
     extract_image_refs,
+    max_images_override,
+    outbound_image_cap,
 )
 
 
@@ -138,6 +141,61 @@ class TestSupportsVisionOverride:
 
 
 
+
+
+# ─── max_images_override / outbound_image_cap ────────────────────────────────
+
+
+class TestMaxImagesOverride:
+    def test_unset_is_none(self):
+        assert max_images_override(None, "custom", "vl") is None
+        assert max_images_override({}, "custom", "vl") is None
+        assert max_images_override({"model": {"supports_vision": True}}, "custom", "vl") is None
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [(8, 8), ("8", 8), (" 12 ", 12), (0, None), (-1, None), (True, None), (2.5, None), ("eight", None), (None, None)],
+    )
+    def test_top_level_value_is_a_positive_count_or_nothing(self, raw, expected):
+        assert max_images_override({"model": {"max_images": raw}}, "custom", "vl") == expected
+
+    def test_named_provider_per_model(self):
+        cfg = {"providers": {"local-vllm": {"models": {"vl": {"max_images": 4}}}}}
+        assert max_images_override(cfg, "local-vllm", "vl") == 4
+        assert max_images_override(cfg, "local-vllm", "other") is None
+
+    def test_named_custom_provider_found_through_model_provider(self):
+        """The runtime rewrites a named custom provider to ``custom``; config keeps its name."""
+        cfg = {"model": {"provider": "custom:local-vllm"}, "providers": {"local-vllm": {"models": {"vl": {"max_images": 4}}}}}
+        assert max_images_override(cfg, "custom", "vl") == 4
+
+    def test_legacy_custom_providers_entry(self):
+        cfg = {"custom_providers": [{"name": "box", "models": {"vl": {"max_images": 2}}}]}
+        assert max_images_override(cfg, "custom", "vl", requested_provider="box") == 2
+
+    def test_top_level_wins_like_supports_vision(self):
+        cfg = {"model": {"max_images": 8}, "providers": {"p": {"models": {"vl": {"max_images": 4}}}}}
+        assert max_images_override(cfg, "p", "vl") == 8
+
+    def test_supports_vision_resolution_is_unchanged(self):
+        cfg = {"model": {"provider": "custom:box"}, "providers": {"box": {"models": {"vl": {"supports_vision": True}}}}}
+        assert _supports_vision_override(cfg, "custom", "vl") is True
+
+
+class TestOutboundImageCap:
+    def test_reads_the_agents_active_route(self):
+        from types import SimpleNamespace
+
+        agent = SimpleNamespace(provider="custom", model="vl", requested_provider="box")
+        cfg = {"custom_providers": [{"name": "box", "models": {"vl": {"max_images": 2}}}]}
+        with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            assert outbound_image_cap(agent) == 2
+
+    def test_unset_keeps_the_default_ceiling(self):
+        from types import SimpleNamespace
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"model": {"provider": "custom"}}):
+            assert outbound_image_cap(SimpleNamespace(provider="custom", model="vl")) is None
 
 
 # ─── _lookup_supports_vision (override-aware) ────────────────────────────────

@@ -148,18 +148,27 @@ def _supports_vision_override(
     """Resolve user-declared vision capability from config.yaml; None when unset.
 
     First hit wins: ``model.supports_vision`` → ``providers.<p>.models.<model>``
-    → legacy ``custom_providers[].models.<model>``. Named custom providers are
-    rewritten to ``provider="custom"`` at runtime while config keeps the user's
-    name under ``model.provider``, so the requested, runtime and config
-    identities are all tried, plus the bare ``<name>`` of any ``custom:<name>``.
+    → legacy ``custom_providers[].models.<model>`` (see :func:`_capability_sources`).
     """
     if not isinstance(cfg, dict):
         return None
-    model_cfg = _dict_or_empty(cfg.get("model"))
+    model_cfg, model_maps = _capability_sources(cfg, provider, requested_provider)
     top = _coerce_capability_bool(model_cfg.get("supports_vision"))
     if top is not None:
         return top
+    return next((v for v in (_model_supports_vision_override(m, model) for m in model_maps) if v is not None), None)
 
+
+def _capability_sources(
+    cfg: dict[str, Any], provider: str, requested_provider: str
+) -> tuple[dict[str, Any], list[Any]]:
+    """The ``model:`` section and, in precedence order, every per-model ``models`` mapping a
+    capability override can live in: ``providers.<p>.models`` then legacy
+    ``custom_providers[].models``. Named custom providers are rewritten to ``provider="custom"``
+    at runtime while config keeps the user's name under ``model.provider``, so the requested,
+    runtime and config identities are all tried, plus the bare ``<name>`` of any ``custom:<name>``.
+    """
+    model_cfg = _dict_or_empty(cfg.get("model"))
     candidates: list[str] = []
     for candidate in filter(None, (requested_provider, provider, _clean_str(model_cfg.get("provider")))):
         candidates.append(candidate)
@@ -170,7 +179,57 @@ def _supports_vision_override(
     providers_cfg = _dict_or_empty(cfg.get("providers"))
     model_maps = [_dict_or_empty(providers_cfg.get(p)).get("models") for p in candidates]
     model_maps += [entry.get("models") for entry in _custom_provider_entries(cfg, candidates)]
-    return next((v for v in (_model_supports_vision_override(m, model) for m in model_maps) if v is not None), None)
+    return model_cfg, model_maps
+
+
+def _coerce_positive_int(raw: Any) -> Optional[int]:
+    """Strict count coercion for capability caps: an int or a digit string above zero; anything
+    else (bools, floats, junk, 0) is None so the cap stays unset rather than guessed."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw.strip())
+    return raw if isinstance(raw, int) and raw > 0 else None
+
+
+def max_images_override(
+    cfg: Optional[dict[str, Any]],
+    provider: str,
+    model: str,
+    *,
+    requested_provider: str = "",
+) -> Optional[int]:
+    """The endpoint's per-request image limit as declared in config.yaml; None when unset.
+
+    Some endpoints refuse a request over a fixed image count with a 400 that is not retried
+    (vLLM's ``--limit-mm-per-prompt``, routes with a per-prompt cap). The send-path eviction
+    already retires old tool-result images in batches, but its ceiling is sized for Anthropic
+    (:mod:`agent.image_eviction_policy`), so a declared limit lowers it. Same precedence as
+    ``supports_vision``: ``model.max_images`` → ``providers.<p>.models.<model>.max_images``
+    → legacy ``custom_providers[].models.<model>.max_images``.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    model_cfg, model_maps = _capability_sources(cfg, provider, requested_provider)
+    top = _coerce_positive_int(model_cfg.get("max_images"))
+    if top is not None:
+        return top
+    per_model = (_dict_or_empty(_dict_or_empty(m).get(model)).get("max_images") for m in model_maps)
+    return next((v for v in map(_coerce_positive_int, per_model) if v is not None), None)
+
+
+def outbound_image_cap(agent: Any) -> Optional[int]:
+    """:func:`max_images_override` for ``agent``'s active route, read per request (a cached config
+    read) so a ``/model`` switch or a config edit applies on the next call. None when unset: the send
+    path then keeps the policy's own ceiling."""
+    from hermes_cli.config import load_config_readonly
+
+    return max_images_override(
+        load_config_readonly(),
+        _clean_str(getattr(agent, "provider", "")),
+        _clean_str(getattr(agent, "model", "")),
+        requested_provider=_clean_str(getattr(agent, "requested_provider", "")),
+    )
 
 
 def _resolve_inference_value(

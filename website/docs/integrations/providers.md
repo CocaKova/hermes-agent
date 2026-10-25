@@ -1468,6 +1468,19 @@ model:
 
 The same key is honored on per-named-provider models (`providers.<name>.models.<id>.supports_vision`) and accepts standard YAML booleans (`true/false/yes/no/on/off/1/0`).
 
+**Per-request image limit (`max_images`).** Some endpoints refuse a request that carries more than a fixed number of images — a vLLM server started with `--limit-mm-per-prompt '{"image": 8}'` answers `At most 8 image(s) may be provided in one prompt.` with an HTTP 400 that ends the turn. Hermes already retires old tool-result images (browser and computer-use screenshots, `vision_analyze` payloads) from the outgoing request in batches, but its default ceiling is sized for Anthropic, so a long screenshot-heavy turn can cross a lower limit first. Declare the endpoint's limit and the same eviction keeps every request under it:
+
+```yaml
+model:
+  provider: custom
+  base_url: http://localhost:8000/v1
+  default: my-vision-model
+  supports_vision: true
+  max_images: 8   # the server's per-request image limit
+```
+
+Like `supports_vision`, it is honored per model under `providers.<name>.models.<id>.max_images` and on legacy `custom_providers` entries; it accepts a positive integer and only ever lowers the ceiling. Only the send-path copy is rewritten — the session history keeps every image. The eviction retires tool-result images only; images you attach yourself are left alone (on turns rebuilt from the session database, `vision.replay_recent_images` bounds how many come back), so attachments that alone exceed the limit are still refused.
+
 A `model_overrides` entry that only corrects metadata (for example `context_window`) for a model the catalog does not know leaves vision and reasoning capability and the output-token limit **unknown** — `vision_analyze`, `video_analyze` and the reasoning-effort picker stay available. Only an explicit `supports_vision: false` / `supports_reasoning: false` in the override marks the model as text-only or non-reasoning.
 
 **Inheriting a catalogued vendor's metadata (`catalog_provider`).** When a named custom provider (a gateway, proxy or reseller) serves models that Hermes already knows under a built-in provider, point the entry at that vendor and its models inherit the catalogued context window, output limit, vision and reasoning flags — no `model_overrides` needed:

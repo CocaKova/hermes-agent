@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
+from agent.image_routing import outbound_image_cap
 from agent.compression_marker import (
     ELISION_MARKER_MAX_LEN,
     _elision_marker,
@@ -1506,7 +1507,7 @@ def _image_payload(msg: dict[str, Any]) -> list[str]:
     return sources
 
 
-def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired_ids: Optional[set[str]] = None) -> int:
+def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired_ids: Optional[set[str]] = None, *, cap: Optional[int] = None) -> int:
     """Drop stale screenshot/vision payloads from the per-call API copy.
 
     Compression's keep-newest pass only runs when prune/compress fires, and the Anthropic
@@ -1518,7 +1519,7 @@ def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired
     Eviction is driven by the provider limit, counted in image BLOCKS, with user uploads
     reserved against the ceiling but never rewritten; the block ceiling depends on the
     request's image dimensions — policy and rationale in :mod:`agent.image_eviction_policy`.
-    Returns the number of messages rewritten.
+    ``cap`` (the endpoint's declared ``max_images``) can only lower it. Returns the number rewritten.
     ``retired_ids`` latches the frontier per session: see :func:`latched_retire_count`.
     """
     carriers: list[tuple[int, list[str]]] = []  # (index, image sources), newest first
@@ -1531,8 +1532,7 @@ def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired
         else:
             reserved.extend(sources)
     retire = outbound_image_retire_count(
-        [len(sources) for _, sources in carriers],
-        len(reserved),
+        [len(sources) for _, sources in carriers], len(reserved), cap=cap,
         carrier_bytes_newest_first=[sum(map(len, sources)) for _, sources in carriers],
         reserved_bytes=sum(map(len, reserved)),
         many_image_safe=images_all_within_many_image_limit([*reserved, *(x for _, ss in carriers for x in ss)]),

@@ -19,7 +19,9 @@ from agent.image_eviction_policy import (
     IMAGE_EVICTION_BATCH,
     OUTBOUND_IMAGE_BUDGET_BYTES,
     OUTBOUND_IMAGE_FLOOR,
+    OUTBOUND_IMAGE_HARD_LIMIT,
     OUTBOUND_IMAGE_LIMIT,
+    outbound_image_block_limit,
     outbound_image_retire_count,
 )
 import itertools
@@ -341,3 +343,74 @@ def test_retirement_is_latched_when_an_upload_leaves_the_request(tmp_path, monke
     before = kept(oversized)
     assert len(before) == OUTBOUND_IMAGE_LIMIT - IMAGE_EVICTION_BATCH
     assert kept(None) == before
+
+
+# ─── a declared endpoint limit (``max_images``) ──────────────────────────────
+# What Hermes' own screenshot tools embed: within the many-image cap, so with no declared limit the
+# ceiling is the hard 100 and a 9-image request goes out whole.
+_SHRUNK = _png_data_url(1568, 1000)
+
+
+def _sent_images(messages: list[dict]) -> int:
+    return sum(
+        1
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        for part in msg["content"]
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    )
+
+
+@pytest.mark.parametrize(
+    ("many_image_safe", "cap", "expected"),
+    [
+        (True, None, OUTBOUND_IMAGE_HARD_LIMIT),
+        (False, None, OUTBOUND_IMAGE_LIMIT),
+        (True, 8, 8),
+        (False, 8, 8),
+        (True, OUTBOUND_IMAGE_HARD_LIMIT + 50, OUTBOUND_IMAGE_HARD_LIMIT),
+        (False, OUTBOUND_IMAGE_LIMIT + 5, OUTBOUND_IMAGE_LIMIT),
+    ],
+)
+def test_declared_cap_only_lowers_the_block_ceiling(many_image_safe, cap, expected):
+    assert outbound_image_block_limit(many_image_safe, cap) == expected
+
+
+def test_screenshots_over_a_declared_cap_are_retired_on_the_send_path():
+    """An endpoint that refuses a 9th image (vLLM ``--limit-mm-per-prompt``, #142602's class)."""
+    uncapped = _screenshot_tool_messages(9, _SHRUNK)
+    assert evict_stale_outbound_tool_images(uncapped, set()) == 0
+    assert _sent_images(uncapped) == 9
+
+    capped = _screenshot_tool_messages(9, _SHRUNK)
+    assert evict_stale_outbound_tool_images(capped, set(), cap=8) > 0
+    assert _sent_images(capped) <= 8
+
+
+@pytest.mark.parametrize("cap", [1, 2, 8])
+def test_a_capped_session_holds_its_frontier_between_batches(cap):
+    """Growing one session a screenshot at a time: never more than ``cap`` images go out, and the
+    oldest image still sent moves in quanta, not on every new screenshot (one prefix rewrite per
+    batch). Caps at or below the keep-newest floor degrade to a quantum of one."""
+    retired: set[str] = set()
+    sent, frontier = [], []
+    for n in range(1, 41):
+        messages = _screenshot_tool_messages(n, _SHRUNK)
+        evict_stale_outbound_tool_images(messages, retired, cap=cap)
+        sent.append(_sent_images(messages))
+        frontier.append(next(i for i, m in enumerate(messages) if _sent_images([m])))
+    assert max(sent) <= cap, sent
+    quantum = max(1, min(IMAGE_EVICTION_BATCH, cap - OUTBOUND_IMAGE_FLOOR))
+    advances = sum(1 for a, b in itertools.pairwise(frontier) if a != b)
+    assert advances <= -(-(40 - cap) // quantum), frontier
+
+
+def test_uploads_count_against_a_declared_cap_and_are_never_rewritten():
+    upload = {
+        "role": "user",
+        "content": [{"type": "text", "text": "this one"}, {"type": "image_url", "image_url": {"url": _SHRUNK}}],
+    }
+    messages = [upload, *_screenshot_tool_messages(8, _SHRUNK)]
+    evict_stale_outbound_tool_images(messages, set(), cap=8)
+    assert _sent_images(messages) <= 8
+    assert _sent_images([messages[0]]) == 1
